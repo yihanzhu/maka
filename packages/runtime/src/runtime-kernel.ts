@@ -30,6 +30,7 @@ import type {
   CompleteEvent,
   QueueEnqueueOutcome,
   QueueUpdateEvent,
+  SandboxBoundaryNegotiationState,
   SessionEvent,
   TokenUsageEvent,
 } from '@maka/core/events';
@@ -111,6 +112,7 @@ import {
   type RuntimeContinuation,
   type RuntimeContinuationSafetyObservation,
 } from './runtime-resume.js';
+import { foldSandboxBoundaryNegotiationState } from './sandbox-boundary-negotiation-state.js';
 import { buildContinuationReplayPlan } from './continuation-replay.js';
 import { PROVIDER_REPLAY_PROJECTION_VERSION } from './model-history.js';
 import {
@@ -801,7 +803,11 @@ export class RuntimeKernel implements RuntimeKernelLike {
       continuation.sessionId,
       continuation.sourceRunId,
     );
-    const sourceEvents = await revalidateContinuationBoundary(continuationAuthority, continuation);
+    const revalidatedBoundary = await revalidateContinuationBoundary(
+      continuationAuthority,
+      continuation,
+    );
+    const sourceEvents = revalidatedBoundary.sourceEvents;
     assertContinuationSourceUnchanged(continuation, sourceRun, sourceEvents);
     await this.revalidateContinuationSafety(continuation);
 
@@ -947,6 +953,7 @@ export class RuntimeKernel implements RuntimeKernelLike {
       continuation,
       run,
       execution,
+      foldSandboxBoundaryNegotiationState(revalidatedBoundary.stateEvents),
       {
         sessionId: continuation.sessionId,
         turnId: continuation.turnId,
@@ -1314,7 +1321,11 @@ export class RuntimeKernel implements RuntimeKernelLike {
     const sourceRun = await this.deps.runStore.readRun(sessionId, continuation.sourceRunId);
     const effectiveToolMode = effectiveToolModeForRun(sourceRun);
     const continuationAuthority = requireRuntimeContinuationAuthority(this.deps.runtimeEventStore);
-    const sourceEvents = await revalidateContinuationBoundary(continuationAuthority, continuation);
+    const revalidatedBoundary = await revalidateContinuationBoundary(
+      continuationAuthority,
+      continuation,
+    );
+    const sourceEvents = revalidatedBoundary.sourceEvents;
     assertContinuationSourceUnchanged(continuation, sourceRun, sourceEvents);
     await this.revalidateContinuationSafety(
       continuation,
@@ -1467,6 +1478,7 @@ export class RuntimeKernel implements RuntimeKernelLike {
       continuation,
       run,
       execution,
+      foldSandboxBoundaryNegotiationState(revalidatedBoundary.stateEvents),
       input.linkedSession === true
         ? {
             sessionId,
@@ -1753,6 +1765,7 @@ export class RuntimeKernel implements RuntimeKernelLike {
     continuation: RuntimeContinuation,
     run: AgentRun,
     execution: PendingExecutionClaim,
+    sandboxBoundaryNegotiationState: SandboxBoundaryNegotiationState,
     messageOwner?: RuntimeMessageRunIdentity,
     onRunStarted?: () => void | Promise<void>,
     revalidateSafety?: () => Promise<void>,
@@ -1842,7 +1855,11 @@ export class RuntimeKernel implements RuntimeKernelLike {
           : (() => {
               throw new Error('Durable continuation is missing its start admission');
             })(),
-        { orchestration: run.effectiveOrchestration, toolMode: run.toolMode },
+        {
+          orchestration: run.effectiveOrchestration,
+          toolMode: run.toolMode,
+          sandboxBoundaryNegotiationState,
+        },
       ),
       {
         source: this.deps.runtimeSource ?? 'desktop',
@@ -3388,7 +3405,7 @@ function requireRuntimeContinuationAuthority(
 async function revalidateContinuationBoundary(
   store: RuntimeContinuationAuthorityStore,
   continuation: RuntimeContinuation,
-): Promise<RuntimeEvent[]> {
+): Promise<{ sourceEvents: RuntimeEvent[]; stateEvents: RuntimeEvent[] }> {
   if (
     !continuation.boundary ||
     !continuation.providerReplayDigest ||
@@ -3437,7 +3454,10 @@ async function revalidateContinuationBoundary(
       'Runtime continuation replay changed after planning',
     );
   }
-  return [...prefixes.at(-1)!.events];
+  return {
+    sourceEvents: [...prefixes.at(-1)!.events],
+    stateEvents: prefixes.flatMap((prefix) => [...prefix.events]),
+  };
 }
 
 function continuationClaimForExecution(

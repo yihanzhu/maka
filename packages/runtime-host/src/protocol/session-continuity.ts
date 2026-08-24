@@ -896,7 +896,13 @@ function decodeSessionToolEvent(value: unknown): SessionToolEvent {
 }
 
 function requireSandboxFailureReason(value: unknown): SandboxBoundaryFailureSignal['reason'] {
-  if (value === 'sandbox_boundary_required' || value === 'requires_bypass') return value;
+  if (
+    value === 'sandbox_boundary_required' ||
+    value === 'requires_bypass' ||
+    value === 'invalid_boundary_declaration'
+  ) {
+    return value;
+  }
   throw invalidProtocolFrame('Invalid Session tool result sandbox failure reason');
 }
 

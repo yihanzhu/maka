@@ -21,6 +21,7 @@ import type {
   SandboxBoundaryExpansion,
   SandboxBoundarySettlement,
 } from '@maka/core/sandbox-boundary';
+import type { SandboxBoundaryNegotiationClosureReason } from '@maka/core/events';
 import { z } from 'zod';
 
 import { sandboxBoundaryExpansionSchema } from './sandbox-boundary-declaration.js';
@@ -40,14 +41,42 @@ export const SANDBOX_BOUNDARY_UNAVAILABLE =
   'Retrying will fail the same way — redo the work inside the paths already allowed, or tell the ' +
   'user which path needs access.';
 
+export const REQUEST_SANDBOX_BOUNDARY_TOOL_NAME = 'request_sandbox_boundary';
+
+export const SANDBOX_BOUNDARY_DENIED_FOR_TURN =
+  'The user denied a sandbox boundary expansion for this logical Turn. Do not request another ' +
+  'expansion in this Turn. Continue only with the authority already available, or explain the ' +
+  'remaining blocker.';
+
+export function sandboxBoundaryFinalizationPrompt(
+  reason: SandboxBoundaryNegotiationClosureReason,
+): string {
+  const cause =
+    reason === 'denied'
+      ? 'The user denied a sandbox boundary expansion and this is the last available response step.'
+      : reason === 'post_denial_retry'
+        ? 'The user denied a sandbox boundary expansion and another blocked authority attempt followed.'
+        : reason === 'invalid_attempt_limit'
+          ? "Invalid or unavailable sandbox boundary requests exhausted this logical Turn's correction budget."
+          : "Repeated unmet sandbox boundary requirements exhausted this logical Turn's handoff budget.";
+  return [
+    '<sandbox_boundary_finalization>',
+    cause,
+    'Do not call tools. Give the user a concise final status using the evidence already available.',
+    'State what remains blocked and what existing-authority alternatives, if any, were tried.',
+    '</sandbox_boundary_finalization>',
+  ].join('\n');
+}
+
 export function buildRequestSandboxBoundaryTool(): MakaTool<
   { expansion: SandboxBoundaryExpansion; justification: string },
   SandboxBoundarySettlement
 > {
   return {
-    name: 'request_sandbox_boundary',
+    name: REQUEST_SANDBOX_BOUNDARY_TOOL_NAME,
+    executionSemantics: 'exclusive_step',
     description:
-      'Request the smallest session sandbox boundary expansion needed to retry a local tool that returned sandbox_boundary_required.',
+      'Request the smallest session sandbox boundary expansion needed to retry a local tool that returned sandbox_boundary_required. If the user denies one, do not request another expansion in the same logical Turn.',
     parameters: z
       .object({
         expansion: sandboxBoundaryExpansionSchema,

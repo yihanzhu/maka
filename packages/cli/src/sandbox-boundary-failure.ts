@@ -17,9 +17,15 @@
  * under the License.
  */
 
-import type { SessionEvent } from '@maka/core/events';
+import type { SandboxBoundaryFailureSignal, SessionEvent } from '@maka/core/events';
 
-type SandboxBoundaryFailureReason = 'sandbox_boundary_required' | 'requires_bypass';
+export type SandboxBoundaryFailureReason = SandboxBoundaryFailureSignal['reason'];
+
+export function isGrantableSandboxBoundaryFailureReason(
+  reason: SandboxBoundaryFailureReason,
+): boolean {
+  return reason === 'sandbox_boundary_required' || reason === 'requires_bypass';
+}
 
 export function sessionEventSandboxBoundaryFailureReason(
   event: SessionEvent,
@@ -38,7 +44,9 @@ export function sessionEventSandboxBoundaryFailureReason(
 function normalizeSandboxBoundaryFailureReason(
   reason: unknown,
 ): SandboxBoundaryFailureReason | undefined {
-  return reason === 'sandbox_boundary_required' || reason === 'requires_bypass'
+  return reason === 'sandbox_boundary_required' ||
+    reason === 'requires_bypass' ||
+    reason === 'invalid_boundary_declaration'
     ? reason
     : undefined;
 }

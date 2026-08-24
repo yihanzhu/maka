@@ -34,6 +34,7 @@ import type {
   QuoteRef,
   SessionEvent,
   SandboxBoundaryRequestEvent,
+  SandboxBoundaryNegotiationState,
   UserQuestionRequestEvent,
 } from './events.js';
 import type { InteractionClosureReason } from './interaction.js';
@@ -88,6 +89,8 @@ export interface BackendSendInput {
    * compatibility projection.
    */
   runtimeContext?: RuntimeEvent[];
+  /** Trusted continuation control capsule derived from the full immutable RuntimeEvent lineage. */
+  sandboxBoundaryNegotiationState?: SandboxBoundaryNegotiationState;
   /** Continue from an already committed RuntimeEvent boundary without adding another user turn. */
   continuation?: RuntimeContinuationMetadata;
   /**

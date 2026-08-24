@@ -254,7 +254,7 @@ describe('Runtime Host maka run adapter', () => {
     assert.equal(stdout.join(''), '');
     assert.equal(
       stderr.join(''),
-      'maka run: sandbox boundary expansion is unavailable in non-interactive mode\n',
+      'maka run: sandbox boundary negotiation did not converge; retry the turn\n',
     );
   });
 
@@ -1513,7 +1513,7 @@ async function* projectedSameStepSandboxFailureEvents(turnId: string): AsyncIter
       ts: 3,
       toolUseId: 'tool-1',
       status: 'errored',
-      sandboxFailureReason: 'sandbox_boundary_required',
+      sandboxFailureReason: 'invalid_boundary_declaration',
     },
   } satisfies SubscriptionFrame).events;
   yield successfulToolResult(turnId, 4);

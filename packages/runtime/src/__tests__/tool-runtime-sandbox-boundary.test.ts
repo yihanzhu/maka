@@ -42,7 +42,12 @@ import {
 } from '../sandbox-boundary-tool.js';
 import { FilesystemWorkerClientError } from '../filesystem-worker/client.js';
 import { SandboxCommandError } from '../sandbox/errors.js';
-import { ToolRuntime, type MakaTool, type ToolRuntimeInput } from '../tool-runtime.js';
+import {
+  ToolRuntime,
+  formatLoopGateText,
+  type MakaTool,
+  type ToolRuntimeInput,
+} from '../tool-runtime.js';
 
 describe('ToolRuntime session sandbox boundary', () => {
   test('rejects an embedding without explicit execution boundary authority', () => {
@@ -179,6 +184,290 @@ describe('ToolRuntime session sandbox boundary', () => {
     const result = (await pending).result as SandboxBoundarySettlement;
     assert.equal(result.request.status, 'approved');
     assert.equal(result.boundary.revision, 1);
+    assert.equal(runtime.hasSandboxBoundaryDenial(), false);
+  });
+
+  test('treats a user denial as final for later expansion requests in the Turn', async () => {
+    const events: SessionEvent[] = [];
+    const managed: ExecutionBoundary = {
+      kind: 'managed',
+      profile: createWorkspaceWritePermissionProfile(),
+      revision: 0,
+    };
+    let created: SandboxBoundaryRequest | undefined;
+    let createCalls = 0;
+    const runtime = new ToolRuntime({
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      header: header(),
+      connection: { providerType: 'openai', slug: 'test' } as never,
+      modelId: 'test',
+      appendMessage: async () => {},
+      readExecutionBoundary: async () => managed,
+      createSandboxBoundaryRequest: async (input) => {
+        createCalls += 1;
+        created = {
+          ...input,
+          status: 'pending',
+          baseRevision: 0,
+          createdAt: 1,
+        };
+        return created;
+      },
+      settleSandboxBoundaryRequest: async () => {
+        assert.ok(created);
+        return {
+          request: { ...created, status: 'denied', settledAt: 2 },
+          boundary: managed,
+          changed: false,
+        };
+      },
+      newId: nextId(),
+      now: () => 1,
+      getPermissionPauseTarget: () => null,
+      runId: 'run-1',
+    });
+    const tool = buildRequestSandboxBoundaryTool();
+    const eventSink = {
+      push: (event: SessionEvent) => events.push(event),
+      pushAndWaitUntilConsumed: async (event: SessionEvent) => {
+        events.push(event);
+      },
+    };
+    const first = runtime.settleToolCall({
+      tool,
+      turnId: 'turn-1',
+      toolCallId: 'tool-boundary-1',
+      input: {
+        expansion: { network: { enabled: true } },
+        justification: 'Use the network.',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    const request = await waitForBoundaryRequest(events);
+    await runtime.respondToSandboxBoundaryRequest('turn-1', {
+      requestId: request.requestId,
+      decision: 'deny',
+    });
+    assert.equal(((await first).result as SandboxBoundarySettlement).request.status, 'denied');
+    assert.equal(runtime.hasSandboxBoundaryDenial(), true);
+
+    const second = await runtime.settleToolCall({
+      tool,
+      turnId: 'turn-1',
+      toolCallId: 'tool-boundary-2',
+      input: {
+        expansion: {
+          filesystem: {
+            entries: [{ path: '/different/file.txt', access: 'write', scope: 'exact' }],
+          },
+        },
+        justification: 'Try a different expansion.',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+
+    assert.match(JSON.stringify(second.result), /denied a sandbox boundary expansion/u);
+    assert.equal(createCalls, 1);
+    assert.equal(runtime.sandboxBoundaryFinalization(), 'post_denial_retry');
+    assert.equal(events.filter((event) => event.type === 'sandbox_boundary_request').length, 1);
+  });
+
+  test('admits only one concurrent nested sandbox boundary request', async () => {
+    const events: SessionEvent[] = [];
+    const managed: ExecutionBoundary = {
+      kind: 'managed',
+      profile: createWorkspaceWritePermissionProfile(),
+      revision: 0,
+    };
+    let created: SandboxBoundaryRequest | undefined;
+    let createCalls = 0;
+    const runtime = new ToolRuntime({
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      header: header(),
+      connection: { providerType: 'openai', slug: 'test' } as never,
+      modelId: 'test',
+      appendMessage: async () => {},
+      readExecutionBoundary: async () => managed,
+      createSandboxBoundaryRequest: async (input) => {
+        createCalls += 1;
+        created = {
+          ...input,
+          status: 'pending',
+          baseRevision: 0,
+          createdAt: 1,
+        };
+        return created;
+      },
+      settleSandboxBoundaryRequest: async () => {
+        assert.ok(created);
+        return {
+          request: { ...created, status: 'denied', settledAt: 2 },
+          boundary: managed,
+          changed: false,
+        };
+      },
+      newId: nextId(),
+      now: () => 1,
+      getPermissionPauseTarget: () => null,
+    });
+    const eventSink = {
+      push: (event: SessionEvent) => events.push(event),
+      pushAndWaitUntilConsumed: async (event: SessionEvent) => {
+        events.push(event);
+      },
+    };
+    const requestTool = (name: string): MakaTool => ({
+      name,
+      description: 'nested request',
+      parameters: {},
+      impl: async (_input, context) =>
+        await context.requestSandboxBoundary!(
+          { network: { enabled: true } },
+          `Request from ${name}.`,
+        ),
+    });
+
+    const first = runtime.settleToolCall({
+      tool: requestTool('nested_boundary_one'),
+      turnId: 'turn-1',
+      toolCallId: 'nested-one',
+      input: {},
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    const second = runtime.settleToolCall({
+      tool: requestTool('nested_boundary_two'),
+      turnId: 'turn-1',
+      toolCallId: 'nested-two',
+      input: {},
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    const request = await waitForBoundaryRequest(events);
+    await runtime.respondToSandboxBoundaryRequest('turn-1', {
+      requestId: request.requestId,
+      decision: 'deny',
+    });
+    const outcomes = await Promise.all([first, second]);
+
+    assert.equal(createCalls, 1);
+    assert.equal(events.filter((event) => event.type === 'sandbox_boundary_request').length, 1);
+    assert.equal(
+      outcomes.filter((outcome) => JSON.stringify(outcome.result).includes('already pending'))
+        .length,
+      1,
+    );
+  });
+
+  test('does not classify a pre-denial command that settles late as a retry', async () => {
+    const events: SessionEvent[] = [];
+    const managed: ExecutionBoundary = {
+      kind: 'managed',
+      profile: createWorkspaceWritePermissionProfile(),
+      revision: 0,
+    };
+    let created: SandboxBoundaryRequest | undefined;
+    let markSlowStarted!: () => void;
+    const slowStarted = new Promise<void>((resolve) => {
+      markSlowStarted = resolve;
+    });
+    let releaseSlow!: (result: unknown) => void;
+    const slowResult = new Promise<unknown>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const runtime = new ToolRuntime({
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      header: header(),
+      connection: { providerType: 'openai', slug: 'test' } as never,
+      modelId: 'test',
+      appendMessage: async () => {},
+      readExecutionBoundary: async () => managed,
+      createSandboxBoundaryRequest: async (input) => {
+        created = {
+          ...input,
+          status: 'pending',
+          baseRevision: 0,
+          createdAt: 1,
+        };
+        return created;
+      },
+      settleSandboxBoundaryRequest: async () => {
+        assert.ok(created);
+        return {
+          request: { ...created, status: 'denied', settledAt: 2 },
+          boundary: managed,
+          changed: false,
+        };
+      },
+      newId: nextId(),
+      now: () => 1,
+      getPermissionPauseTarget: () => null,
+    });
+    const eventSink = {
+      push: (event: SessionEvent) => events.push(event),
+      pushAndWaitUntilConsumed: async (event: SessionEvent) => {
+        events.push(event);
+      },
+    };
+    const slow = runtime.settleToolCall({
+      tool: {
+        name: 'Bash',
+        description: 'slow pre-denial command',
+        parameters: {},
+        impl: async () => {
+          markSlowStarted();
+          return await slowResult;
+        },
+      },
+      turnId: 'turn-1',
+      toolCallId: 'slow-before-denial',
+      input: {},
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    await slowStarted;
+    const boundary = runtime.settleToolCall({
+      tool: buildRequestSandboxBoundaryTool(),
+      turnId: 'turn-1',
+      toolCallId: 'deny-while-slow',
+      input: {
+        expansion: { network: { enabled: true } },
+        justification: 'Request while another command is running.',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    const request = await waitForBoundaryRequest(events);
+    await runtime.respondToSandboxBoundaryRequest('turn-1', {
+      requestId: request.requestId,
+      decision: 'deny',
+    });
+    await boundary;
+    releaseSlow({
+      kind: 'terminal',
+      cwd: '/workspace',
+      cmd: 'blocked',
+      status: 'failed',
+      exitCode: 1,
+      output: {
+        mode: 'pipes',
+        stdout: '',
+        stderr: 'denied',
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        redacted: false,
+      },
+      sandboxDenial: { likely: true },
+    });
+    await slow;
+
+    assert.equal(runtime.hasSandboxBoundaryDenial(), true);
+    assert.equal(runtime.sandboxBoundaryFinalization(), undefined);
   });
 
   test('publishes a hosted boundary only after admission and settles only through its continuation', async () => {
@@ -689,6 +978,203 @@ describe('ToolRuntime session sandbox boundary', () => {
     });
   });
 
+  test('bounds byte-identical structured boundary requirements across the generic loop gate', async () => {
+    const events: SessionEvent[] = [];
+    const runtime = new ToolRuntime({
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      header: header(),
+      connection: { providerType: 'openai', slug: 'test' } as never,
+      modelId: 'test',
+      appendMessage: async () => {},
+      readExecutionBoundary: async () => ({
+        kind: 'managed',
+        profile: createWorkspaceWritePermissionProfile(),
+        revision: 0,
+      }),
+      newId: nextId(),
+      now: () => 1,
+      getPermissionPauseTarget: () => null,
+    });
+    const tool: MakaTool = {
+      name: 'Read',
+      description: 'test',
+      parameters: {},
+      impl: () => {
+        throw new FilesystemWorkerClientError({
+          reason: 'sandbox_boundary_required',
+          stage: 'validation',
+          recoverable: true,
+          requiredExpansion: {
+            filesystem: {
+              entries: [{ path: '/outside/file.txt', access: 'read', scope: 'exact' }],
+            },
+          },
+        });
+      },
+    };
+    const eventSink = {
+      push: (event: SessionEvent) => events.push(event),
+      pushAndWaitUntilConsumed: async (event: SessionEvent) => {
+        events.push(event);
+      },
+    };
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await runtime.settleToolCall({
+        tool,
+        turnId: 'turn-1',
+        toolCallId: `required-${attempt}`,
+        input: {},
+        abortSignal: new AbortController().signal,
+        eventSink,
+      });
+      assert.equal(
+        runtime.sandboxBoundaryFinalization(),
+        attempt === 3 ? 'unresolved_requirement_limit' : undefined,
+      );
+    }
+
+    const results = events.filter((event) => event.type === 'tool_result');
+    assert.equal(results.length, 3);
+    assert.deepEqual(results[2]?.content, {
+      kind: 'text',
+      text: formatLoopGateText('Read'),
+      sandboxFailure: {
+        reason: 'sandbox_boundary_required',
+        requiredExpansion: {
+          filesystem: {
+            entries: [{ path: '/outside/file.txt', access: 'read', scope: 'exact' }],
+          },
+        },
+      },
+    });
+
+    const postBudget = await runtime.settleToolCall({
+      tool: buildRequestSandboxBoundaryTool(),
+      turnId: 'turn-1',
+      toolCallId: 'post-budget-request',
+      input: {
+        expansion: { network: { enabled: true } },
+        justification: 'Try after the budget closed.',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    assert.match(JSON.stringify(postBudget.result), /negotiation is closed/u);
+    assert.equal(events.filter((event) => event.type === 'sandbox_boundary_request').length, 0);
+  });
+
+  test('keeps a corrected requirement eligible after two invalid attempts and resets on approval', async () => {
+    const events: SessionEvent[] = [];
+    let boundary: ExecutionBoundary = {
+      kind: 'managed',
+      profile: createWorkspaceWritePermissionProfile(),
+      revision: 0,
+    };
+    let created: SandboxBoundaryRequest | undefined;
+    const runtime = new ToolRuntime({
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      header: header(),
+      connection: { providerType: 'openai', slug: 'test' } as never,
+      modelId: 'test',
+      appendMessage: async () => {},
+      readExecutionBoundary: async () => boundary,
+      createSandboxBoundaryRequest: async (input) => {
+        created = {
+          ...input,
+          status: 'pending',
+          baseRevision: 0,
+          createdAt: 1,
+        };
+        return created;
+      },
+      settleSandboxBoundaryRequest: async () => {
+        assert.ok(created);
+        boundary = { ...boundary, revision: 1 };
+        return {
+          request: { ...created, status: 'approved', settledAt: 2 },
+          boundary,
+          changed: true,
+        };
+      },
+      newId: nextId(),
+      now: () => 1,
+      getPermissionPauseTarget: () => null,
+    });
+    runtime.seedSandboxBoundaryNegotiation({ invalidAttempts: 2 });
+    const eventSink = {
+      push: (event: SessionEvent) => events.push(event),
+      pushAndWaitUntilConsumed: async (event: SessionEvent) => {
+        events.push(event);
+      },
+    };
+    await runtime.settleToolCall({
+      tool: {
+        name: 'Read',
+        description: 'require authority',
+        parameters: {},
+        impl: () => {
+          throw new FilesystemWorkerClientError({
+            reason: 'sandbox_boundary_required',
+            stage: 'validation',
+            recoverable: true,
+            requiredExpansion: { network: { enabled: true } },
+          });
+        },
+      },
+      turnId: 'turn-1',
+      toolCallId: 'corrected-requirement',
+      input: {},
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    assert.equal(runtime.sandboxBoundaryFinalization(), undefined);
+
+    const approval = runtime.settleToolCall({
+      tool: buildRequestSandboxBoundaryTool(),
+      turnId: 'turn-1',
+      toolCallId: 'corrected-request',
+      input: {
+        expansion: { network: { enabled: true } },
+        justification: 'Use the required network authority.',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    const request = await waitForBoundaryRequest(events);
+    await runtime.respondToSandboxBoundaryRequest('turn-1', {
+      requestId: request.requestId,
+      decision: 'allow',
+    });
+    assert.equal(((await approval).result as SandboxBoundarySettlement).request.status, 'approved');
+    assert.equal(runtime.sandboxBoundaryFinalization(), undefined);
+    assert.equal(runtime.hasSandboxBoundaryDenial(), false);
+
+    await runtime.settleToolCall({
+      tool: {
+        name: 'Bash',
+        description: 'invalid correction after approval',
+        parameters: {},
+        impl: () => {
+          throw new SandboxCommandError({
+            domain: 'command',
+            stage: 'validation',
+            reason: 'invalid_boundary_declaration',
+            recoverable: true,
+          });
+        },
+      },
+      turnId: 'turn-1',
+      toolCallId: 'post-approval-invalid-one',
+      input: {},
+      abortSignal: new AbortController().signal,
+      eventSink,
+    });
+    assert.equal(runtime.sandboxBoundaryFinalization(), undefined);
+  });
+
   test('cancels a suspended nested boundary wait when its cell aborts', async () => {
     const events: SessionEvent[] = [];
     const settlements: string[] = [];
@@ -934,6 +1420,41 @@ describe('ToolRuntime session sandbox boundary', () => {
       type: 'error-text',
       value: `Error: ${SANDBOX_BOUNDARY_UNAVAILABLE}`,
     });
+    assert.equal(runtime.sandboxBoundaryFinalization(), undefined);
+
+    const repeated = await runtime.settleToolCall({
+      tool: buildRequestSandboxBoundaryTool() as unknown as MakaTool,
+      turnId: 'turn-1',
+      toolCallId: 'call-boundary-unavailable-variant',
+      input: {
+        expansion: { network: { enabled: true } },
+        justification: 'try a different request',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink: {
+        push: () => {},
+        pushAndWaitUntilConsumed: async () => {},
+      },
+    });
+    assert.match(JSON.stringify(repeated.result), /not available on this surface/u);
+    assert.equal(runtime.sandboxBoundaryFinalization(), undefined);
+
+    const third = await runtime.settleToolCall({
+      tool: buildRequestSandboxBoundaryTool() as unknown as MakaTool,
+      turnId: 'turn-1',
+      toolCallId: 'call-boundary-unavailable-third',
+      input: {
+        expansion: { network: { enabled: true } },
+        justification: 'one final request',
+      },
+      abortSignal: new AbortController().signal,
+      eventSink: {
+        push: () => {},
+        pushAndWaitUntilConsumed: async () => {},
+      },
+    });
+    assert.match(JSON.stringify(third.result), /not available on this surface/u);
+    assert.equal(runtime.sandboxBoundaryFinalization(), 'invalid_attempt_limit');
   });
 });
 

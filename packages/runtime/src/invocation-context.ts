@@ -31,7 +31,12 @@
  * minted inside a flow stay 1:1 with the invocation that produced them.
  */
 
-import type { AttachmentRef, InlineReference, QuoteRef } from '@maka/core/events';
+import type {
+  AttachmentRef,
+  InlineReference,
+  QuoteRef,
+  SandboxBoundaryNegotiationState,
+} from '@maka/core/events';
 import type { SteeringLease } from '@maka/core/backend-types';
 import type { RuntimeEvent, RuntimeEventStatus } from '@maka/core/runtime-event';
 import type { StoredMessage } from '@maka/core/session';
@@ -121,6 +126,8 @@ export interface InvocationRequest {
    * passes this through without adding the current turn's RuntimeEvents.
    */
   runtimeContext?: RuntimeEvent[];
+  /** Trusted continuation control capsule; never projected into model history. */
+  sandboxBoundaryNegotiationState?: SandboxBoundaryNegotiationState;
   /** Safe-boundary continuation metadata. No synthetic user RuntimeEvent is emitted when present. */
   continuation?: InvocationContinuationMetadata;
   /** Optional initial user RuntimeEvent already minted by an outer run owner. */

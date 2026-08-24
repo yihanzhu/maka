@@ -28,6 +28,8 @@ import type { AgentRunHeader } from '@maka/core/agent-run';
 import type { AttachmentByteReader } from '@maka/core/attachments';
 import type { BackendSendInput } from '@maka/core/backend-types';
 import type { LlmConnection } from '@maka/core/llm-connections';
+import { createManagedExecutionBoundary } from '@maka/core/sandbox-boundary';
+import { createWorkspaceWritePermissionProfile } from '@maka/core/permission-profile';
 import type { SessionHeader } from '@maka/core/session';
 import type { StorageRef } from '@maka/core/events';
 import { encodeCanonicalRuntimeEvent } from '@maka/core/canonical-runtime-event';
@@ -69,8 +71,16 @@ import {
 import { buildDefaultContextBudgetPolicy } from '../context-budget-policy.js';
 import { buildRuntimeEventModelReplayPlan, buildSteeringEnvelope } from '../model-history.js';
 import { HistoryCompactSummarizerError } from '../history-compact-summarizer.js';
-import type { SandboxDiagnosticsSnapshot } from '../sandbox/diagnostics.js';
+import type {
+  SandboxDiagnosticsProvider,
+  SandboxDiagnosticsSnapshot,
+} from '../sandbox/diagnostics.js';
 import { SandboxCommandError } from '../sandbox/errors.js';
+import { buildRequestSandboxBoundaryTool } from '../sandbox-boundary-tool.js';
+import {
+  preflightDeclaredSandboxBoundary,
+  sandboxBoundaryExpansionSchema,
+} from '../sandbox-boundary-declaration.js';
 import { FilesystemWorkerClientError } from '../filesystem-worker/client.js';
 import { RunTrace } from '../run-trace.js';
 import type {
@@ -1133,7 +1143,8 @@ describe('AiSdkBackend model history', () => {
       modelId: 'mock-model-id',
       modelFactory: () => model,
       tools: [],
-      sandboxDiagnosticsSnapshot: sandboxSnapshot(),
+      readExecutionBoundary: readManagedSandboxBoundary,
+      sandboxDiagnostics: fixedSandboxDiagnostics(),
       recordRunTrace: (event) => traces.push(event),
       newId: idGenerator(),
       now: monotonicClock(),
@@ -1151,6 +1162,77 @@ describe('AiSdkBackend model history', () => {
     assert.equal(JSON.stringify(contextEvent).includes('/tmp/maka'), false);
   });
 
+  test('refreshes point-in-time sandbox capabilities on every Turn', async () => {
+    const model = completionModel();
+    let resolutions = 0;
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [],
+      readExecutionBoundary: readManagedSandboxBoundary,
+      sandboxDiagnostics: {
+        resolve: async () => {
+          const snapshot = sandboxSnapshot();
+          resolutions += 1;
+          return {
+            ...snapshot,
+            capabilities: {
+              ...snapshot.capabilities,
+              command: {
+                ...snapshot.capabilities.command,
+                status: resolutions === 1 ? 'available' : 'unavailable',
+              },
+            },
+          };
+        },
+      },
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+
+    await drain(backend.send({ turnId: 'turn-fresh-1', text: 'first', context: [] }));
+    await drain(backend.send({ turnId: 'turn-fresh-2', text: 'second', context: [] }));
+
+    assert.equal(resolutions, 2);
+    assert.match(JSON.stringify(model.doStreamCalls[0]?.prompt), /Command sandbox: available/u);
+    assert.match(JSON.stringify(model.doStreamCalls[1]?.prompt), /Command sandbox: unavailable/u);
+    await backend.dispose();
+  });
+
+  test('omits local sandbox context for an external execution boundary', async () => {
+    const model = completionModel();
+    let resolutions = 0;
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [],
+      sandboxDiagnostics: {
+        resolve: async () => {
+          resolutions += 1;
+          return sandboxSnapshot();
+        },
+      },
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+
+    await drain(backend.send({ turnId: 'turn-external', text: 'current user', context: [] }));
+
+    assert.equal(resolutions, 0);
+    assert.doesNotMatch(JSON.stringify(compactPrompt(model)), /<sandbox_context>/u);
+    await backend.dispose();
+  });
+
   test('continues without sandbox prompt context when the snapshot cannot be rendered', async () => {
     const model = completionModel();
     const traces: RunTraceEvent[] = [];
@@ -1164,10 +1246,11 @@ describe('AiSdkBackend model history', () => {
       modelId: 'mock-model-id',
       modelFactory: () => model,
       tools: [],
-      sandboxDiagnosticsSnapshot: {
+      readExecutionBoundary: readManagedSandboxBoundary,
+      sandboxDiagnostics: fixedSandboxDiagnostics({
         ...snapshot,
         profile: { ...snapshot.profile, cwd: '/tmp/invalid\nworkspace' },
-      },
+      }),
       recordRunTrace: (event) => traces.push(event),
       newId: idGenerator(),
       now: monotonicClock(),
@@ -1224,9 +1307,12 @@ describe('AiSdkBackend model history', () => {
       modelId: 'mock-model-id',
       modelFactory: () => model,
       tools: [],
-      resolveSandboxDiagnosticsSnapshot: async () => {
-        markResolverEntered();
-        return await stalledResolver;
+      readExecutionBoundary: readManagedSandboxBoundary,
+      sandboxDiagnostics: {
+        resolve: async () => {
+          markResolverEntered();
+          return await stalledResolver;
+        },
       },
       recordRunTrace: (event) => traces.push(event),
       newId: idGenerator(),
@@ -1262,6 +1348,531 @@ describe('AiSdkBackend model history', () => {
       traces.some((event) => event.type === 'sandbox_context_failed'),
       false,
     );
+    await backend.dispose();
+  });
+
+  test('bounds a repeated expansion attempt after user denial with one tool-free final step', async () => {
+    let streamCalls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        streamCalls += 1;
+        const chunks: LanguageModelV4StreamPart[] =
+          streamCalls < 3
+            ? [
+                { type: 'stream-start', warnings: [] },
+                {
+                  type: 'tool-call',
+                  toolCallId: `boundary-${streamCalls}`,
+                  toolName: streamCalls === 1 ? 'request_sandbox_boundary' : 'bAsH',
+                  input: JSON.stringify(
+                    streamCalls === 1
+                      ? {
+                          expansion: { network: { enabled: true } },
+                          justification: 'Use the network.',
+                        }
+                      : {
+                          command: 'curl https://example.com',
+                          boundary_intent: 'expand',
+                          required_boundary: { network: { enabled: false } },
+                        },
+                  ),
+                },
+                {
+                  type: 'finish',
+                  finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+                  usage: emptyUsage(),
+                },
+              ]
+            : [
+                { type: 'stream-start', warnings: [] },
+                {
+                  type: 'tool-call',
+                  toolCallId: 'forbidden-final-bash',
+                  toolName: 'Bash',
+                  input: JSON.stringify({
+                    command: 'echo must-not-run',
+                    boundary_intent: 'expand',
+                    required_boundary: { network: { enabled: true } },
+                  }),
+                },
+                {
+                  type: 'finish',
+                  finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+                  usage: emptyUsage(),
+                },
+              ];
+        return {
+          stream: simulateReadableStream({
+            chunks,
+            initialDelayInMs: null,
+            chunkDelayInMs: null,
+          }),
+        };
+      },
+    });
+    const durable = durableTurnHarness('turn-denial-bound', 'Request access only if required.');
+    const managed = createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 0);
+    let pendingRequest:
+      | Awaited<ReturnType<NonNullable<AiSdkBackendInput['createSandboxBoundaryRequest']>>>
+      | undefined;
+    let createCalls = 0;
+    let bashImplCalls = 0;
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [
+        buildRequestSandboxBoundaryTool(),
+        {
+          name: 'Bash',
+          description: 'Run one command.',
+          parameters: z.object({
+            command: z.string(),
+            boundary_intent: z.literal('expand'),
+            required_boundary: z.object({ network: z.object({ enabled: z.literal(true) }) }),
+          }),
+          impl: async () => {
+            bashImplCalls += 1;
+            throw new SandboxCommandError({
+              domain: 'command',
+              stage: 'validation',
+              reason: 'sandbox_boundary_required',
+              recoverable: true,
+              requiredExpansion: { network: { enabled: true } },
+            });
+          },
+        },
+      ],
+      readExecutionBoundary: async () => managed,
+      createSandboxBoundaryRequest: async (input) => {
+        createCalls += 1;
+        pendingRequest = {
+          ...input,
+          status: 'pending',
+          baseRevision: 0,
+          createdAt: 1,
+        };
+        return pendingRequest;
+      },
+      settleSandboxBoundaryRequest: async () => {
+        assert.ok(pendingRequest);
+        pendingRequest = { ...pendingRequest, status: 'denied', settledAt: 2 };
+        return { request: pendingRequest, boundary: managed, changed: false };
+      },
+      loadTurnRuntimeEvents: durable.loadTurnRuntimeEvents,
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+    const events: SessionEvent[] = [];
+    const consuming = collectEvents(backend.send(durable.input()), events, durable.record);
+
+    await waitFor(() => events.some((event) => event.type === 'sandbox_boundary_request'));
+    const request = events.find((event) => event.type === 'sandbox_boundary_request');
+    assert.ok(request?.type === 'sandbox_boundary_request');
+    await backend.respondToSandboxBoundary({ requestId: request.requestId, decision: 'deny' });
+    await consuming;
+
+    assert.equal(streamCalls, 3);
+    assert.equal(createCalls, 1);
+    assert.equal(bashImplCalls, 0);
+    assert.equal(events.filter((event) => event.type === 'sandbox_boundary_request').length, 1);
+    assert.doesNotMatch(
+      JSON.stringify(model.doStreamCalls[1]?.tools ?? []),
+      /request_sandbox_boundary/u,
+    );
+    assert.match(JSON.stringify(model.doStreamCalls[1]?.tools ?? []), /Bash/u);
+    assert.deepEqual(model.doStreamCalls[2]?.tools ?? [], []);
+    assert.match(JSON.stringify(model.doStreamCalls[2]?.prompt), /sandbox_boundary_finalization/u);
+    assert.equal(
+      events.find((event) => event.type === 'complete')?.stopReason,
+      'permission_handoff',
+    );
+    assert.equal(managed.revision, 0);
+    await backend.dispose();
+  });
+
+  test('reserves the last capped step for a denial summary', async () => {
+    let streamCalls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        streamCalls += 1;
+        const chunks: LanguageModelV4StreamPart[] =
+          streamCalls === 1
+            ? [
+                { type: 'stream-start', warnings: [] },
+                {
+                  type: 'tool-call',
+                  toolCallId: 'capped-denial-request',
+                  toolName: 'request_sandbox_boundary',
+                  input: JSON.stringify({
+                    expansion: { network: { enabled: true } },
+                    justification: 'Use the network.',
+                  }),
+                },
+                {
+                  type: 'finish',
+                  finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+                  usage: emptyUsage(),
+                },
+              ]
+            : [
+                { type: 'stream-start', warnings: [] },
+                { type: 'text-start', id: 'capped-denial-final' },
+                {
+                  type: 'text-delta',
+                  id: 'capped-denial-final',
+                  delta: 'The request was denied.',
+                },
+                { type: 'text-end', id: 'capped-denial-final' },
+                {
+                  type: 'finish',
+                  finishReason: { unified: 'stop', raw: 'stop' },
+                  usage: emptyUsage(),
+                },
+              ];
+        return {
+          stream: simulateReadableStream({ chunks, initialDelayInMs: null, chunkDelayInMs: null }),
+        };
+      },
+    });
+    const durable = durableTurnHarness('turn-capped-denial', 'Request access if needed.');
+    const managed = createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 0);
+    let pendingRequest:
+      | Awaited<ReturnType<NonNullable<AiSdkBackendInput['createSandboxBoundaryRequest']>>>
+      | undefined;
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [buildRequestSandboxBoundaryTool()],
+      readExecutionBoundary: async () => managed,
+      createSandboxBoundaryRequest: async (input) => {
+        pendingRequest = {
+          ...input,
+          status: 'pending',
+          baseRevision: 0,
+          createdAt: 1,
+        };
+        return pendingRequest;
+      },
+      settleSandboxBoundaryRequest: async () => {
+        assert.ok(pendingRequest);
+        pendingRequest = { ...pendingRequest, status: 'denied', settledAt: 2 };
+        return { request: pendingRequest, boundary: managed, changed: false };
+      },
+      loadTurnRuntimeEvents: durable.loadTurnRuntimeEvents,
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+    const events: SessionEvent[] = [];
+    const consuming = collectEvents(
+      backend.send({ ...durable.input(), maxSteps: 2 }),
+      events,
+      durable.record,
+    );
+    await waitFor(() => events.some((event) => event.type === 'sandbox_boundary_request'));
+    const request = events.find((event) => event.type === 'sandbox_boundary_request');
+    assert.ok(request?.type === 'sandbox_boundary_request');
+    await backend.respondToSandboxBoundary({ requestId: request.requestId, decision: 'deny' });
+    await consuming;
+
+    assert.equal(streamCalls, 2);
+    assert.deepEqual(model.doStreamCalls[1]?.tools ?? [], []);
+    assert.match(JSON.stringify(model.doStreamCalls[1]?.prompt), /sandbox_boundary_finalization/u);
+    assert.equal(
+      events.find((event) => event.type === 'complete')?.stopReason,
+      'permission_handoff',
+    );
+    await backend.dispose();
+  });
+
+  test('bounds varied invalid boundary declarations before any user decision', async () => {
+    let streamCalls = 0;
+    const invalidCalls = [
+      {
+        toolName: 'Bash',
+        input: {
+          command: 'pwd',
+          boundary_intent: 'EXPAND',
+          required_boundary: { network: { enabled: true } },
+        },
+      },
+      {
+        toolName: 'Bash',
+        input: {
+          command: 'pwd',
+          boundary_intent: 'expand',
+          required_boundary: {
+            filesystem: {
+              entries: [{ path: '.', access: 'read', scope: 'exact' }],
+            },
+          },
+        },
+      },
+      {
+        toolName: 'request_sandbox_boundary',
+        input: { expansion: { network: { enabled: true } }, justification: '   ' },
+      },
+    ] as const;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        const call = invalidCalls[streamCalls];
+        streamCalls += 1;
+        const chunks: LanguageModelV4StreamPart[] = call
+          ? [
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'tool-call',
+                toolCallId: `invalid-boundary-${streamCalls}`,
+                toolName: call.toolName,
+                input: JSON.stringify(call.input),
+              },
+              {
+                type: 'finish',
+                finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+                usage: emptyUsage(),
+              },
+            ]
+          : [
+              { type: 'stream-start', warnings: [] },
+              { type: 'text-start', id: 'invalid-final' },
+              {
+                type: 'text-delta',
+                id: 'invalid-final',
+                delta: 'The boundary declaration could not be corrected in this turn.',
+              },
+              { type: 'text-end', id: 'invalid-final' },
+              {
+                type: 'finish',
+                finishReason: { unified: 'stop', raw: 'stop' },
+                usage: emptyUsage(),
+              },
+            ];
+        return {
+          stream: simulateReadableStream({
+            chunks,
+            initialDelayInMs: null,
+            chunkDelayInMs: null,
+          }),
+        };
+      },
+    });
+    let bashImplCalls = 0;
+    let createCalls = 0;
+    const durable = durableTurnHarness('turn-invalid-boundary', 'Use the current boundary.');
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [
+        buildRequestSandboxBoundaryTool(),
+        {
+          name: 'Bash',
+          description: 'Run one command.',
+          parameters: z.object({
+            command: z.string(),
+            boundary_intent: z.literal('expand'),
+            required_boundary: sandboxBoundaryExpansionSchema,
+          }),
+          impl: async (input, context) => {
+            bashImplCalls += 1;
+            await preflightDeclaredSandboxBoundary(input.required_boundary, context);
+            return 'unexpected';
+          },
+        },
+      ],
+      readExecutionBoundary: async () =>
+        createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 0),
+      createSandboxBoundaryRequest: async () => {
+        createCalls += 1;
+        throw new Error('invalid calls must not create a boundary request');
+      },
+      settleSandboxBoundaryRequest: async () => {
+        throw new Error('invalid calls must not settle a boundary request');
+      },
+      loadTurnRuntimeEvents: durable.loadTurnRuntimeEvents,
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+    const events: SessionEvent[] = [];
+    await collectEvents(backend.send(durable.input()), events, durable.record);
+
+    assert.equal(streamCalls, 4);
+    assert.equal(bashImplCalls, 1);
+    assert.equal(createCalls, 0);
+    assert.deepEqual(model.doStreamCalls[3]?.tools ?? [], []);
+    assert.match(
+      JSON.stringify(model.doStreamCalls[3]?.prompt),
+      /Invalid or unavailable sandbox boundary/iu,
+    );
+    assert.equal(
+      events.find((event) => event.type === 'complete')?.stopReason,
+      'permission_handoff',
+    );
+    assert.equal(events.filter((event) => event.type === 'sandbox_boundary_request').length, 0);
+    await backend.dispose();
+  });
+
+  test('ends as permission handoff when invalid convergence exhausts maxSteps', async () => {
+    let streamCalls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        streamCalls += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: 'stream-start', warnings: [] },
+              {
+                type: 'tool-call',
+                toolCallId: `capped-invalid-${streamCalls}`,
+                toolName: 'Bash',
+                input: JSON.stringify({
+                  command: `pwd ${streamCalls}`,
+                  boundary_intent: `EXPAND-${streamCalls}`,
+                }),
+              },
+              {
+                type: 'finish',
+                finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+                usage: emptyUsage(),
+              },
+            ],
+            initialDelayInMs: null,
+            chunkDelayInMs: null,
+          }),
+        };
+      },
+    });
+    const durable = durableTurnHarness('turn-capped-invalid', 'Use the current boundary.');
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [
+        {
+          name: 'Bash',
+          description: 'Run one command.',
+          parameters: z.object({ command: z.string(), boundary_intent: z.literal('expand') }),
+          impl: async () => 'unexpected',
+        },
+      ],
+      readExecutionBoundary: async () =>
+        createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 0),
+      loadTurnRuntimeEvents: durable.loadTurnRuntimeEvents,
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+    const events: SessionEvent[] = [];
+    await collectEvents(backend.send({ ...durable.input(), maxSteps: 3 }), events, durable.record);
+
+    assert.equal(streamCalls, 3);
+    assert.equal(
+      events.find((event) => event.type === 'complete')?.stopReason,
+      'permission_handoff',
+    );
+    await backend.dispose();
+  });
+
+  test('counts parallel boundary failures as one model correction round', async () => {
+    let streamCalls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        streamCalls += 1;
+        const chunks: LanguageModelV4StreamPart[] =
+          streamCalls === 1
+            ? [
+                { type: 'stream-start', warnings: [] },
+                ...[1, 2, 3].map(
+                  (index): LanguageModelV4StreamPart => ({
+                    type: 'tool-call',
+                    toolCallId: `parallel-boundary-${index}`,
+                    toolName: 'Read',
+                    input: JSON.stringify({ path: `/outside/${index}` }),
+                  }),
+                ),
+                {
+                  type: 'finish',
+                  finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+                  usage: emptyUsage(),
+                },
+              ]
+            : [
+                { type: 'stream-start', warnings: [] },
+                { type: 'text-start', id: 'parallel-boundary-final' },
+                {
+                  type: 'text-delta',
+                  id: 'parallel-boundary-final',
+                  delta: 'I can now consolidate the required authority.',
+                },
+                { type: 'text-end', id: 'parallel-boundary-final' },
+                {
+                  type: 'finish',
+                  finishReason: { unified: 'stop', raw: 'stop' },
+                  usage: emptyUsage(),
+                },
+              ];
+        return {
+          stream: simulateReadableStream({ chunks, initialDelayInMs: null, chunkDelayInMs: null }),
+        };
+      },
+    });
+    const durable = durableTurnHarness('turn-parallel-boundary', 'Inspect three paths.');
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [
+        buildRequestSandboxBoundaryTool(),
+        {
+          name: 'Read',
+          description: 'Read one path.',
+          parameters: z.object({ path: z.string() }),
+          impl: async (input) => {
+            throw new FilesystemWorkerClientError({
+              reason: 'sandbox_boundary_required',
+              stage: 'validation',
+              recoverable: true,
+              requiredExpansion: {
+                filesystem: {
+                  entries: [{ path: input.path, access: 'read', scope: 'exact' }],
+                },
+              },
+            });
+          },
+        },
+      ],
+      readExecutionBoundary: async () =>
+        createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 0),
+      loadTurnRuntimeEvents: durable.loadTurnRuntimeEvents,
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+    const events: SessionEvent[] = [];
+    await collectEvents(backend.send(durable.input()), events, durable.record);
+
+    assert.equal(streamCalls, 2);
+    assert.match(JSON.stringify(model.doStreamCalls[1]?.tools ?? []), /request_sandbox_boundary/u);
+    assert.equal(events.find((event) => event.type === 'complete')?.stopReason, 'end_turn');
     await backend.dispose();
   });
 
@@ -1600,8 +2211,9 @@ describe('AiSdkBackend model history', () => {
       apiKey: 'sk-test',
       modelId: 'mock-model-id',
       modelFactory: () => model,
-      tools: [],
-      sandboxDiagnosticsSnapshot: sandboxSnapshot(),
+      tools: [buildRequestSandboxBoundaryTool()],
+      readExecutionBoundary: readManagedSandboxBoundary,
+      sandboxDiagnostics: fixedSandboxDiagnostics(),
       newId: idGenerator(),
       now: monotonicClock(),
     });
@@ -1612,19 +2224,81 @@ describe('AiSdkBackend model history', () => {
         text: '',
         context: [],
         runtimeContext: [
-          runtimeTextEvent({
+          runtimeEvent({
             id: 'rt-u',
+            invocationId: 'inv-origin',
             turnId: 'turn-source',
             role: 'user',
             author: 'user',
-            text: 'original user',
+            content: { kind: 'text', text: 'original user' },
+          }),
+          runtimeEvent({
+            id: 'rt-boundary-request',
+            invocationId: 'inv-origin',
+            turnId: 'turn-source',
+            role: 'system',
+            author: 'system',
+            actions: {
+              stateDelta: {
+                sandboxBoundaryRequest: {
+                  requestId: 'request-denied',
+                  toolUseId: 'tool-denied',
+                  justification: 'Use the network.',
+                  expansion: { network: { enabled: true } },
+                },
+              },
+            },
+          }),
+          runtimeEvent({
+            id: 'rt-boundary-denial',
+            invocationId: 'inv-origin',
+            turnId: 'turn-source',
+            role: 'system',
+            author: 'user',
+            actions: {
+              stateDelta: {
+                sandboxBoundaryDecision: {
+                  requestId: 'request-denied',
+                  decision: 'deny',
+                  status: 'denied',
+                  revision: 7,
+                },
+              },
+            },
+          }),
+          runtimeEvent({
+            id: 'rt-first-continuation',
+            invocationId: 'inv-resume-1',
+            runId: 'run-resume-1',
+            turnId: 'turn-resume-1',
+            role: 'system',
+            author: 'system',
+            actions: {
+              continuationStart: {
+                protocol: 'continuation_start_v2',
+                provenance: 'runtime_admission',
+                claimId: 'claim-resume-1',
+                boundaryDigest: `sha256:${'a'.repeat(64)}`,
+                immediateSource: {
+                  sessionId: 'session-1',
+                  invocationId: 'inv-origin',
+                  runId: 'run-prev',
+                  turnId: 'turn-source',
+                  highWater: 3,
+                  prefixDigest: `sha256:${'b'.repeat(64)}`,
+                },
+                replayManifestDigest: `sha256:${'c'.repeat(64)}`,
+                providerProjectionVersion: 1,
+                providerReplayDigest: `sha256:${'d'.repeat(64)}`,
+              },
+            },
           }),
         ],
         continuation: {
-          sourceInvocationId: 'invocation-source',
-          sourceRunId: 'run-source',
-          sourceTurnId: 'turn-source',
-          sourceRuntimeEventHighWater: 1,
+          sourceInvocationId: 'inv-resume-1',
+          sourceRunId: 'run-resume-1',
+          sourceTurnId: 'turn-resume-1',
+          sourceRuntimeEventHighWater: 4,
         },
       }),
     );
@@ -1632,10 +2306,78 @@ describe('AiSdkBackend model history', () => {
     const prompt = compactPrompt(model) as Array<{ role: string; content: unknown }>;
     assert.match(JSON.stringify(prompt[0]), /<sandbox_context>/u);
     assert.match(JSON.stringify(prompt[0]), /Profile: workspace-write/u);
+    assert.match(JSON.stringify(prompt[0]), /denied a sandbox boundary expansion/u);
+    assert.doesNotMatch(
+      JSON.stringify(model.doStreamCalls[0]?.tools ?? []),
+      /request_sandbox_boundary/u,
+    );
     assert.deepEqual(prompt.slice(1), [
       { role: 'user', content: [{ type: 'text', text: 'original user' }] },
     ]);
     assert.equal(JSON.stringify(prompt).match(/original user/gu)?.length, 1);
+
+    await drain(backend.send({ turnId: 'turn-new-user', text: 'new user turn', context: [] }));
+    assert.match(JSON.stringify(model.doStreamCalls[1]?.tools ?? []), /request_sandbox_boundary/u);
+    await backend.dispose();
+  });
+
+  test('restores a full-lineage negotiation capsule before continuation dispatch', async () => {
+    const model = completionModel();
+    const backend = createTestAiSdkBackend({
+      sessionId: 'session-1',
+      header: header(),
+      appendMessage: async () => {},
+      connection: connection(),
+      apiKey: 'sk-test',
+      modelId: 'mock-model-id',
+      modelFactory: () => model,
+      tools: [buildRequestSandboxBoundaryTool()],
+      readExecutionBoundary: readManagedSandboxBoundary,
+      newId: idGenerator(),
+      now: monotonicClock(),
+    });
+    const events: SessionEvent[] = [];
+    await collectEvents(
+      backend.send({
+        turnId: 'turn-capsule-resume',
+        text: '',
+        context: [],
+        runtimeContext: [
+          runtimeEvent({
+            id: 'capsule-user',
+            invocationId: 'inv-capsule-source',
+            turnId: 'turn-capsule-source',
+            role: 'user',
+            author: 'user',
+            content: { kind: 'text', text: 'original user request' },
+          }),
+        ],
+        sandboxBoundaryNegotiationState: {
+          denied: false,
+          invalidAttempts: 0,
+          unresolvedRequirements: 3,
+          finalizationReason: 'unresolved_requirement_limit',
+        },
+        continuation: {
+          sourceInvocationId: 'inv-capsule-source',
+          sourceRunId: 'run-prev',
+          sourceTurnId: 'turn-capsule-source',
+          sourceRuntimeEventHighWater: 1,
+        },
+      }),
+      events,
+    );
+
+    assert.deepEqual(model.doStreamCalls[0]?.tools ?? [], []);
+    assert.match(
+      JSON.stringify(model.doStreamCalls[0]?.prompt),
+      /unmet sandbox boundary requirements/u,
+    );
+    assert.equal(
+      events.find((event) => event.type === 'complete')?.stopReason,
+      'permission_handoff',
+    );
+    await backend.dispose();
   });
 
   test('continuation replays the original user after diagnostic terminal errors with no StoredMessage context', async () => {
@@ -13761,7 +14503,10 @@ function runtimeTextEvent(input: {
 
 function runtimeEvent(input: {
   id: string;
+  invocationId?: string;
+  runId?: string;
   turnId: string;
+  ts?: number;
   role: RuntimeEvent['role'];
   author: RuntimeEvent['author'];
   content?: RuntimeEvent['content'];
@@ -13771,11 +14516,11 @@ function runtimeEvent(input: {
 }): RuntimeEvent {
   return {
     id: input.id,
-    invocationId: 'inv-1',
-    runId: 'run-prev',
+    invocationId: input.invocationId ?? 'inv-1',
+    runId: input.runId ?? 'run-prev',
     sessionId: 'session-1',
     turnId: input.turnId,
-    ts: 1,
+    ts: input.ts ?? 1,
     partial: false,
     role: input.role,
     author: input.author,
@@ -14059,6 +14804,15 @@ function sandboxSnapshot(): SandboxDiagnosticsSnapshot {
       },
     },
   };
+}
+
+const readManagedSandboxBoundary: AiSdkBackendInput['readExecutionBoundary'] = async () =>
+  createManagedExecutionBoundary(createWorkspaceWritePermissionProfile(), 7);
+
+function fixedSandboxDiagnostics(
+  snapshot: SandboxDiagnosticsSnapshot = sandboxSnapshot(),
+): SandboxDiagnosticsProvider {
+  return { resolve: async () => snapshot };
 }
 
 function connection(): LlmConnection {

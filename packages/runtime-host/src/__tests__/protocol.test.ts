@@ -405,6 +405,12 @@ describe('Runtime Host bootstrap protocol', () => {
       },
       {
         ...identity,
+        type: 'tool_result',
+        status: 'errored',
+        sandboxFailureReason: 'invalid_boundary_declaration',
+      },
+      {
+        ...identity,
         type: 'tool_result_preview',
         isError: false,
         content: {

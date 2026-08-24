@@ -461,6 +461,61 @@ describe('maka activate JSONL protocol', () => {
     });
   });
 
+  test('retries nonconvergent sandbox declarations instead of requesting permission', async () => {
+    for (const reason of ['invalid_boundary_declaration'] as const) {
+      const lines: string[] = [];
+      const result = await runMakaActivationCli(
+        [
+          '--state-root',
+          ROOTS.stateRoot,
+          '--workspace-root',
+          ROOTS.workspaceRoot,
+          '--config-root',
+          ROOTS.configRoot,
+        ],
+        {
+          ...fakeDeps({
+            result: {
+              ...completedResult(),
+              finalOutput: undefined,
+              sandboxBoundary: 'unresolved',
+              sandboxBoundaryFailureReason: reason,
+            },
+            events: [
+              {
+                type: 'tool_result',
+                id: `event-${reason}`,
+                turnId: 'turn-1',
+                ts: 1,
+                toolUseId: 'tool-boundary',
+                isError: true,
+                content: {
+                  kind: 'text',
+                  text: 'boundary negotiation failed',
+                  sandboxFailure: { reason },
+                },
+              },
+            ],
+          }),
+          writeStdout: (text) => lines.push(text.trim()),
+        },
+      );
+
+      assert.equal(result, 4);
+      assert.deepEqual(JSON.parse(lines.at(-1)!), {
+        protocol: 'maka.activation',
+        schemaVersion: 1,
+        type: 'outcome',
+        activationId: 'activation-1',
+        cloudSessionId: 'cloud-session-1',
+        makaSessionId: 'maka-session-1',
+        status: 'retryable_failure',
+        reason: 'sandbox_boundary_nonconvergent',
+        requiredAction: 'retry_activation',
+      });
+    }
+  });
+
   test('retries non-permission blocked sessions instead of requesting permission', async () => {
     for (const blockedReason of ['auth', 'tool_failed'] as const) {
       const lines: string[] = [];

@@ -681,7 +681,7 @@ export interface SandboxDenialRecovery extends SandboxDenialSignal {
 }
 
 export interface SandboxBoundaryFailureSignal {
-  reason: 'sandbox_boundary_required' | 'requires_bypass';
+  reason: 'sandbox_boundary_required' | 'requires_bypass' | 'invalid_boundary_declaration';
   requiredExpansion?: SandboxBoundaryExpansion;
   source?: 'client_capability';
 }
@@ -975,6 +975,20 @@ export interface SandboxBoundaryDecisionAckEvent extends BaseEvent {
   decision: 'allow' | 'deny';
   status: Exclude<SandboxBoundaryRequestStatus, 'pending'>;
   revision: number;
+}
+
+export type SandboxBoundaryNegotiationClosureReason =
+  | 'denied'
+  | 'invalid_attempt_limit'
+  | 'post_denial_retry'
+  | 'unresolved_requirement_limit';
+
+/** Trusted Runtime control state restored across safe-boundary continuations. */
+export interface SandboxBoundaryNegotiationState {
+  denied: boolean;
+  invalidAttempts: number;
+  unresolvedRequirements: number;
+  finalizationReason?: SandboxBoundaryNegotiationClosureReason;
 }
 
 /**

@@ -31,7 +31,10 @@ import { projectSessionCatalogSummary, readRuntimeHostSessions } from '@maka/run
 import { connectRuntimeHostCli, resolveRuntimeHostCliTarget } from './runtime-host-cli-context.js';
 import { createRuntimeHostRunContext } from './runtime-host-run-command.js';
 import type { MakaRunOutcome } from './run-command-core.js';
-import { sessionEventSandboxBoundaryFailureReason } from './sandbox-boundary-failure.js';
+import {
+  isGrantableSandboxBoundaryFailureReason,
+  sessionEventSandboxBoundaryFailureReason,
+} from './sandbox-boundary-failure.js';
 
 const PROTOCOL = 'maka.activation' as const;
 const SCHEMA_VERSION = 1 as const;
@@ -422,7 +425,8 @@ export async function runMakaActivationCli(
   let context: MakaActivationContext | undefined;
   let session: SessionSummary | undefined = existing;
   let invocation: MakaRunOutcome | undefined;
-  let streamBoundaryFailure = false;
+  let streamGrantableBoundaryFailure = false;
+  let streamBoundaryNonconvergence = false;
   let timedOut = false;
   let interrupted = false;
   let streamFailed = false;
@@ -516,7 +520,14 @@ export async function runMakaActivationCli(
       );
       const drain = (async () => {
         for await (const event of stream) {
-          if (sessionEventSandboxBoundaryFailureReason(event)) streamBoundaryFailure = true;
+          const boundaryFailureReason = sessionEventSandboxBoundaryFailureReason(event);
+          if (boundaryFailureReason) {
+            if (isGrantableSandboxBoundaryFailureReason(boundaryFailureReason)) {
+              streamGrantableBoundaryFailure = true;
+            } else {
+              streamBoundaryNonconvergence = true;
+            }
+          }
           writeRuntimeEvent(sessionEventToRuntimeEvent(event, session!.id));
           if (event.type === 'sandbox_boundary_request') {
             await context!.runtime.respondToSandboxBoundary(session!.id, {
@@ -588,8 +599,22 @@ export async function runMakaActivationCli(
   if (invocation?.failure?.class === 'permission_denied') {
     return finish('blocked', 'permission_denied', undefined, 'grant_permission');
   }
+  const invocationBoundaryNonconvergence =
+    invocation?.sandboxBoundaryFailureReason !== undefined &&
+    !isGrantableSandboxBoundaryFailureReason(invocation.sandboxBoundaryFailureReason);
   if (
-    (streamBoundaryFailure && invocation?.sandboxBoundary !== 'recovered') ||
+    (streamBoundaryNonconvergence || invocationBoundaryNonconvergence) &&
+    invocation?.sandboxBoundary !== 'recovered'
+  ) {
+    return finish(
+      'retryable_failure',
+      'sandbox_boundary_nonconvergent',
+      undefined,
+      'retry_activation',
+    );
+  }
+  if (
+    (streamGrantableBoundaryFailure && invocation?.sandboxBoundary !== 'recovered') ||
     invocation?.sandboxBoundary === 'unresolved'
   ) {
     return finish('blocked', 'permission_required', undefined, 'grant_permission');

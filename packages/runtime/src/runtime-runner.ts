@@ -152,6 +152,7 @@ export interface RuntimeContinuationRunOptions {
 
 export interface RuntimeContinuationAdmissionOptions {
   context?: InvocationRequest['context'];
+  sandboxBoundaryNegotiationState?: InvocationRequest['sandboxBoundaryNegotiationState'];
   orchestration?: InvocationRequest['orchestration'];
   toolMode?: InvocationRequest['toolMode'];
 }
@@ -526,6 +527,9 @@ export function issueRuntimeContinuationAdmissionReceipt(
     text: '',
     context: options.context ?? [],
     runtimeContext: continuation.runtimeContext,
+    ...(options.sandboxBoundaryNegotiationState
+      ? { sandboxBoundaryNegotiationState: options.sandboxBoundaryNegotiationState }
+      : {}),
     continuation: invocationContinuationMetadata(continuation),
     source: 'test',
     ...(options.orchestration ? { orchestration: options.orchestration } : {}),
@@ -567,6 +571,13 @@ function snapshotInvocationRequest(
       : {}),
     ...(request.runtimeContext !== undefined
       ? { runtimeContext: cloneAndFreezeSnapshotValue(request.runtimeContext) }
+      : {}),
+    ...(request.sandboxBoundaryNegotiationState !== undefined
+      ? {
+          sandboxBoundaryNegotiationState: cloneAndFreezeSnapshotValue(
+            request.sandboxBoundaryNegotiationState,
+          ),
+        }
       : {}),
     ...(continuation !== undefined
       ? { continuation: cloneAndFreezeSnapshotValue(continuation) }
@@ -750,6 +761,9 @@ function buildFlowInput(request: InvocationRequest): FlowInput {
     text: request.text,
     context: request.context ?? [],
     ...(request.runtimeContext !== undefined ? { runtimeContext: request.runtimeContext } : {}),
+    ...(request.sandboxBoundaryNegotiationState !== undefined
+      ? { sandboxBoundaryNegotiationState: request.sandboxBoundaryNegotiationState }
+      : {}),
     ...(continuation !== undefined ? { continuation } : {}),
     ...(request.attachments !== undefined ? { attachments: request.attachments } : {}),
     ...(request.quotes !== undefined ? { quotes: request.quotes } : {}),

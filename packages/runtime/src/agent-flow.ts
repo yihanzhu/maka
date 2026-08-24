@@ -49,7 +49,7 @@
  * `RuntimeRunner -> AiSdkFlow` without a flag day.
  */
 
-import type { AttachmentRef, QuoteRef } from '@maka/core/events';
+import type { AttachmentRef, QuoteRef, SandboxBoundaryNegotiationState } from '@maka/core/events';
 import type { SteeringLease } from '@maka/core/backend-types';
 import type { StoredMessage } from '@maka/core/session';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
@@ -101,6 +101,8 @@ export interface FlowInput {
    * compatibility projection.
    */
   runtimeContext?: RuntimeEvent[];
+  /** Trusted continuation control capsule used only for Runtime state restoration. */
+  sandboxBoundaryNegotiationState?: SandboxBoundaryNegotiationState;
   /** Continue the committed history directly instead of appending a new user message. */
   continuation?: RuntimeContinuationMetadata;
   /**

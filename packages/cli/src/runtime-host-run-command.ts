@@ -52,6 +52,10 @@ import {
 } from './runtime-host-session-driver.js';
 import type { CreateSessionRequest, MakaPreparedSessionTurn } from './session-driver.js';
 import {
+  isGrantableSandboxBoundaryFailureReason,
+  type SandboxBoundaryFailureReason,
+} from './sandbox-boundary-failure.js';
+import {
   formatRuntimeHostCliTaskBlockers,
   isRuntimeHostCliTaskBlocked,
   readRuntimeHostCliTaskReadiness,
@@ -571,7 +575,13 @@ type TurnOutcomeObservation =
   | {
       readonly kind: 'tool_result';
       readonly toolUseId: string;
-      readonly outcome: 'sandbox_failure' | 'success';
+      readonly outcome: 'sandbox_failure';
+      readonly sandboxFailureReason: SandboxBoundaryFailureReason;
+    }
+  | {
+      readonly kind: 'tool_result';
+      readonly toolUseId: string;
+      readonly outcome: 'success';
     };
 
 type TerminalOutcomeObservation = Extract<TurnOutcomeObservation, { kind: 'terminal' }>;
@@ -584,7 +594,10 @@ class TurnOutcomeClassifier {
   >();
   readonly #unresolvedSandboxFailures = new Map<
     string,
-    { readonly failedStepId: string | undefined }
+    {
+      readonly failedStepId: string | undefined;
+      readonly reason: SandboxBoundaryFailureReason;
+    }
   >();
   #finalOutput: string | undefined;
   #terminal: TerminalOutcomeObservation | undefined;
@@ -617,6 +630,7 @@ class TurnOutcomeClassifier {
         if (observation.outcome === 'sandbox_failure') {
           this.#unresolvedSandboxFailures.set(observation.toolUseId, {
             failedStepId: call?.stepId,
+            reason: observation.sandboxFailureReason,
           });
           return;
         }
@@ -651,6 +665,12 @@ class TurnOutcomeClassifier {
         : this.#sandboxBoundaryRecovered
           ? 'recovered'
           : 'none';
+    const unresolvedReasons = [...this.#unresolvedSandboxFailures.values()].map(
+      (failure) => failure.reason,
+    );
+    const sandboxBoundaryFailureReason =
+      unresolvedReasons.find((reason) => !isGrantableSandboxBoundaryFailureReason(reason)) ??
+      unresolvedReasons.at(-1);
     const failure =
       terminal?.status === 'failed'
         ? terminal.failure
@@ -664,6 +684,7 @@ class TurnOutcomeClassifier {
       ...(completed && this.#finalOutput !== undefined ? { finalOutput: this.#finalOutput } : {}),
       ...(!completed ? { failure } : {}),
       sandboxBoundary,
+      ...(sandboxBoundaryFailureReason ? { sandboxBoundaryFailureReason } : {}),
     };
   }
 }
@@ -769,6 +790,7 @@ function observationFromToolResult(
       kind: 'tool_result',
       toolUseId: result.toolUseId,
       outcome: 'sandbox_failure',
+      sandboxFailureReason: result.content.sandboxFailure.reason,
     };
   }
   return result.isError

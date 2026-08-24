@@ -35,6 +35,8 @@ import type {
   SandboxBoundaryDecisionAckEvent,
   SandboxBoundaryRequestEvent,
   SessionEvent,
+  SandboxBoundaryFailureSignal,
+  SandboxBoundaryNegotiationClosureReason,
   ToolResultPreviewContent,
   SandboxDenialSignal,
   ToolActivityKind,
@@ -86,9 +88,21 @@ import {
 import { AdmissionLimiter } from './admission-limiter.js';
 import type { AgentProfile } from './agent-catalog.js';
 import type { SubagentExecutionRef } from './subagent-execution.js';
-import { sandboxErrorMetadata, serializeSandboxError } from './sandbox/errors.js';
-import { normalizeSandboxBoundaryExpansion } from './sandbox-boundary-path.js';
-import { SANDBOX_BOUNDARY_UNAVAILABLE } from './sandbox-boundary-tool.js';
+import {
+  SandboxCommandError,
+  sandboxErrorMetadata,
+  serializeSandboxError,
+} from './sandbox/errors.js';
+import {
+  normalizeSandboxBoundaryExpansion,
+  SandboxBoundaryDeclarationError,
+} from './sandbox-boundary-path.js';
+import {
+  REQUEST_SANDBOX_BOUNDARY_TOOL_NAME,
+  SANDBOX_BOUNDARY_DENIED_FOR_TURN,
+  SANDBOX_BOUNDARY_UNAVAILABLE,
+} from './sandbox-boundary-tool.js';
+import { SANDBOX_BOUNDARY_NEGOTIATION_FAILURE_LIMIT } from './sandbox-boundary-negotiation-state.js';
 import {
   RuntimeInteractionAdmissionRejectedError,
   RuntimeInteractionClosedError,
@@ -321,6 +335,12 @@ export const DEFAULT_PERMISSION_TIMEOUT_MS = 300_000;
  * identical *failures* is.
  */
 export const LOOP_GATE_IDENTICAL_THRESHOLD = 3;
+export interface SandboxBoundaryNegotiationSeed {
+  readonly denied?: boolean;
+  readonly invalidAttempts?: number;
+  readonly unresolvedRequirements?: number;
+  readonly finalizationReason?: SandboxBoundaryNegotiationClosureReason;
+}
 
 const SUBAGENT_TOOL_LIMIT_MESSAGE =
   '只读探索并发过多：同一轮最多 5 个子代理。请等待已有探索完成后再继续。';
@@ -520,8 +540,17 @@ export class ToolRuntime {
    */
   private lastFailedToolCallSignature: string | undefined;
   private failedToolCallStreak = 0;
+  private lastFailedToolCallBoundaryFailure: SandboxBoundaryFailureSignal | undefined;
   private lastAmbiguousComputerSignature: string | undefined;
   private readonly recentSandboxDenials = new Set<string>();
+  private sandboxBoundaryDenied = false;
+  private sandboxBoundaryApprovalGeneration = 0;
+  private sandboxBoundaryInvalidAttempts = 0;
+  private sandboxBoundaryUnresolvedRequirements = 0;
+  private readonly sandboxBoundaryInvalidCorrectionScopes = new Set<string>();
+  private readonly sandboxBoundaryRequirementCorrectionScopes = new Set<string>();
+  private sandboxBoundaryRequestInFlight = false;
+  private sandboxBoundaryFinalizationReason?: SandboxBoundaryNegotiationClosureReason;
   private readonly durableToolAttempts = new Map<string, DurableToolAttempt>();
   private readonly activeToolSettlements = new Set<Promise<unknown>>();
   private readonly readExecutionBoundary: NonNullable<ToolRuntimeInput['readExecutionBoundary']>;
@@ -794,10 +823,109 @@ export class ToolRuntime {
     this.gating = undefined;
     this.lastFailedToolCallSignature = undefined;
     this.failedToolCallStreak = 0;
+    this.lastFailedToolCallBoundaryFailure = undefined;
     this.lastAmbiguousComputerSignature = undefined;
     this.recentSandboxDenials.clear();
+    this.sandboxBoundaryDenied = false;
+    this.sandboxBoundaryApprovalGeneration = 0;
+    this.sandboxBoundaryInvalidAttempts = 0;
+    this.sandboxBoundaryUnresolvedRequirements = 0;
+    this.sandboxBoundaryInvalidCorrectionScopes.clear();
+    this.sandboxBoundaryRequirementCorrectionScopes.clear();
+    this.sandboxBoundaryRequestInFlight = false;
+    this.sandboxBoundaryFinalizationReason = undefined;
     this.durableToolAttempts.clear();
     this.stepAdmissions.clear();
+  }
+
+  hasSandboxBoundaryDenial(): boolean {
+    return this.sandboxBoundaryDenied;
+  }
+
+  seedSandboxBoundaryNegotiation(seed: SandboxBoundaryNegotiationSeed): void {
+    this.sandboxBoundaryInvalidCorrectionScopes.clear();
+    this.sandboxBoundaryRequirementCorrectionScopes.clear();
+    this.sandboxBoundaryDenied = seed.denied === true;
+    this.sandboxBoundaryApprovalGeneration = 0;
+    this.sandboxBoundaryInvalidAttempts = Math.min(
+      SANDBOX_BOUNDARY_NEGOTIATION_FAILURE_LIMIT,
+      Math.max(0, seed.invalidAttempts ?? 0),
+    );
+    this.sandboxBoundaryUnresolvedRequirements = Math.min(
+      SANDBOX_BOUNDARY_NEGOTIATION_FAILURE_LIMIT,
+      Math.max(0, seed.unresolvedRequirements ?? 0),
+    );
+    this.sandboxBoundaryFinalizationReason = seed.finalizationReason;
+  }
+
+  sandboxBoundaryFinalization(): SandboxBoundaryNegotiationClosureReason | undefined {
+    return this.sandboxBoundaryFinalizationReason;
+  }
+
+  forceSandboxBoundaryFinalization(reason: SandboxBoundaryNegotiationClosureReason): void {
+    this.sandboxBoundaryFinalizationReason ??= reason;
+  }
+
+  private recordSandboxBoundaryNegotiationFailure(
+    failure: SandboxBoundaryFailureSignal,
+    correctionScope?: string,
+    approvalGeneration?: number,
+  ): SandboxBoundaryFailureSignal {
+    if (
+      approvalGeneration !== undefined &&
+      approvalGeneration !== this.sandboxBoundaryApprovalGeneration
+    ) {
+      return failure;
+    }
+    if (this.sandboxBoundaryDenied) {
+      this.forceSandboxBoundaryFinalization('post_denial_retry');
+      return failure;
+    }
+    if (failure.reason === 'sandbox_boundary_required' || failure.reason === 'requires_bypass') {
+      if (correctionScope && this.sandboxBoundaryRequirementCorrectionScopes.has(correctionScope)) {
+        return failure;
+      }
+      if (correctionScope) this.sandboxBoundaryRequirementCorrectionScopes.add(correctionScope);
+      this.sandboxBoundaryUnresolvedRequirements += 1;
+      if (
+        this.sandboxBoundaryUnresolvedRequirements >= SANDBOX_BOUNDARY_NEGOTIATION_FAILURE_LIMIT
+      ) {
+        this.forceSandboxBoundaryFinalization('unresolved_requirement_limit');
+      }
+      return failure;
+    }
+    if (correctionScope && this.sandboxBoundaryInvalidCorrectionScopes.has(correctionScope)) {
+      return failure;
+    }
+    if (correctionScope) this.sandboxBoundaryInvalidCorrectionScopes.add(correctionScope);
+    this.sandboxBoundaryInvalidAttempts += 1;
+    if (this.sandboxBoundaryInvalidAttempts >= SANDBOX_BOUNDARY_NEGOTIATION_FAILURE_LIMIT) {
+      this.forceSandboxBoundaryFinalization('invalid_attempt_limit');
+    }
+    return failure;
+  }
+
+  private recordInvalidSandboxBoundaryAttempt(
+    correctionScope?: string,
+    approvalGeneration?: number,
+  ): SandboxBoundaryFailureSignal {
+    return this.recordSandboxBoundaryNegotiationFailure(
+      { reason: 'invalid_boundary_declaration' },
+      correctionScope,
+      approvalGeneration,
+    );
+  }
+
+  private recordPostDenialSandboxFailure(approvalGeneration?: number): void {
+    if (
+      approvalGeneration !== undefined &&
+      approvalGeneration !== this.sandboxBoundaryApprovalGeneration
+    ) {
+      return;
+    }
+    if (this.sandboxBoundaryDenied) {
+      this.forceSandboxBoundaryFinalization('post_denial_retry');
+    }
   }
 
   /**
@@ -809,10 +937,15 @@ export class ToolRuntime {
    * exception: a blocked call records nothing, so the streak stays parked at the
    * threshold and every further identical repeat keeps being blocked.
    */
-  private recordLoopGateOutcome(signature: string, failed: boolean): void {
+  private recordLoopGateOutcome(
+    signature: string,
+    failed: boolean,
+    boundaryFailure?: SandboxBoundaryFailureSignal,
+  ): void {
     if (!failed) {
       this.lastFailedToolCallSignature = undefined;
       this.failedToolCallStreak = 0;
+      this.lastFailedToolCallBoundaryFailure = undefined;
       return;
     }
     if (signature === this.lastFailedToolCallSignature) {
@@ -821,6 +954,7 @@ export class ToolRuntime {
       this.lastFailedToolCallSignature = signature;
       this.failedToolCallStreak = 1;
     }
+    this.lastFailedToolCallBoundaryFailure = boundaryFailure;
   }
 
   async writeSyntheticToolResult(
@@ -982,6 +1116,16 @@ export class ToolRuntime {
       );
     }
     const callSignature = `${ctx.origin}:${tool.name} ${loopGateArgsKey(executionArgs, toolUseId)}`;
+    const sandboxBoundaryCorrectionScope =
+      ctx.origin === 'provider' && stepId
+        ? `provider-step:${stepId}`
+        : ctx.parentToolCallId
+          ? `code-parent:${ctx.parentToolCallId}`
+          : ctx.parentOperationId
+            ? `code-operation:${ctx.parentOperationId}`
+            : `tool-call:${toolUseId}`;
+    const sandboxBoundaryApprovalGeneration = this.sandboxBoundaryApprovalGeneration;
+    const boundaryAuthorityAttempt = isBoundaryAuthorityAttempt(tool.name, executionArgs);
     const computerSemanticSignature =
       tool.categoryHint === 'computer_use'
         ? computerUseSemanticSignature(permissionArgs)
@@ -1063,7 +1207,7 @@ export class ToolRuntime {
      */
     const refuseBeforeDispatch = async (
       text: string,
-      sandboxFailure?: Extract<ToolResultContent, { kind: 'text' }>['sandboxFailure'],
+      sandboxFailure?: SandboxBoundaryFailureSignal,
     ): Promise<void> => {
       pushCallEvent('preflight');
       await this.writeSyntheticToolResult(
@@ -1102,7 +1246,13 @@ export class ToolRuntime {
       ...(tool.categoryHint !== undefined ? { categoryHint: tool.categoryHint } : {}),
     });
     if (admissionFailure) {
-      await refuseBeforeDispatch(admissionFailure);
+      const sandboxFailure = boundaryAuthorityAttempt
+        ? this.recordInvalidSandboxBoundaryAttempt(
+            sandboxBoundaryCorrectionScope,
+            sandboxBoundaryApprovalGeneration,
+          )
+        : undefined;
+      await refuseBeforeDispatch(admissionFailure, sandboxFailure);
       trace?.emit('tool', 'tool_failed', 'Tool rejected by exclusive-step admission', {
         toolUseId,
         toolName: tool.name,
@@ -1110,10 +1260,16 @@ export class ToolRuntime {
         status: 'error',
         errorClass: 'ExclusiveStepConflict',
       });
-      this.recordLoopGateOutcome(callSignature, true);
+      this.recordLoopGateOutcome(callSignature, true, sandboxFailure);
       return this.errorReturn(admissionFailure);
     }
     if (permissionArgsError !== undefined) {
+      const sandboxFailure = boundaryAuthorityAttempt
+        ? this.recordInvalidSandboxBoundaryAttempt(
+            sandboxBoundaryCorrectionScope,
+            sandboxBoundaryApprovalGeneration,
+          )
+        : undefined;
       // Computer Use keeps its own formatter: the generic one relays whatever
       // the error carries, and these arguments can hold typed text. The
       // replacement names the offending fields and nothing else, so a model
@@ -1137,7 +1293,7 @@ export class ToolRuntime {
               args: executionArgs,
               error: permissionArgsError,
             });
-      await refuseBeforeDispatch(msg);
+      await refuseBeforeDispatch(msg, sandboxFailure);
       this.input.recordToolInvocation?.({
         sessionId: this.input.sessionId,
         turnId,
@@ -1173,7 +1329,7 @@ export class ToolRuntime {
         status: 'error',
         errorClass: 'InvalidArguments',
       });
-      this.recordLoopGateOutcome(callSignature, true);
+      this.recordLoopGateOutcome(callSignature, true, sandboxFailure);
       return this.errorReturn(msg);
     }
 
@@ -1207,7 +1363,14 @@ export class ToolRuntime {
     }
     if (repeatedFailedCall) {
       const reason = formatLoopGateText(tool.name);
-      await refuseBeforeDispatch(reason);
+      const sandboxFailure = this.lastFailedToolCallBoundaryFailure
+        ? this.recordSandboxBoundaryNegotiationFailure(
+            this.lastFailedToolCallBoundaryFailure,
+            sandboxBoundaryCorrectionScope,
+            sandboxBoundaryApprovalGeneration,
+          )
+        : undefined;
+      await refuseBeforeDispatch(reason, sandboxFailure);
       trace?.emit('tool', 'tool_failed', 'Loop-gate blocked a repeated identical failing call', {
         toolUseId,
         toolName: tool.name,
@@ -1315,6 +1478,7 @@ export class ToolRuntime {
     // once for every exit (return or throw). The pre-impl guards record their own
     // failures above, since they early-return before this point.
     let attemptFailed = true;
+    let attemptBoundaryFailure: SandboxBoundaryFailureSignal | undefined;
     try {
       // Pause the stream idle watchdog for the whole tool execution. In the
       // ai-sdk step loop a tool runs *between* model requests — the tool-call
@@ -1420,6 +1584,7 @@ export class ToolRuntime {
           durationMs,
         );
         if (hasSandboxDenial(content)) {
+          this.recordPostDenialSandboxFailure(sandboxBoundaryApprovalGeneration);
           const denialKey = sandboxDenialKey(tool.name, this.input.header.cwd, executionArgs);
           this.recentSandboxDenials.add(denialKey);
           if (content.kind === 'terminal' || content.kind === 'shell_run') {
@@ -1530,6 +1695,15 @@ export class ToolRuntime {
       if (isInteractionControlError(err)) throw err;
       output.flush();
       const sandboxError = serializeSandboxError(err);
+      const sandboxFailure = sandboxBoundaryFailureSignal(sandboxError);
+      const recordedSandboxFailure = sandboxFailure
+        ? this.recordSandboxBoundaryNegotiationFailure(
+            sandboxFailure,
+            sandboxBoundaryCorrectionScope,
+            sandboxBoundaryApprovalGeneration,
+          )
+        : undefined;
+      attemptBoundaryFailure = recordedSandboxFailure;
       const uncertainOutcome = uncertainOutcomeSignalFromError(err);
       const errorClass = uncertainOutcome ? 'OutcomeUnknown' : classifyError(err);
       const terminalFailure = coerceTerminalFailure(
@@ -1540,6 +1714,7 @@ export class ToolRuntime {
       );
       if (terminalFailure) {
         if (terminalFailure.sandboxDenied) {
+          this.recordPostDenialSandboxFailure(sandboxBoundaryApprovalGeneration);
           const denialKey = sandboxDenialKey(tool.name, this.input.header.cwd, executionArgs);
           this.recentSandboxDenials.add(denialKey);
           trace?.emit(
@@ -1626,7 +1801,7 @@ export class ToolRuntime {
         msg,
         queue,
         sandboxDenialSignalFromError(err),
-        sandboxBoundaryFailureSignal(sandboxError),
+        recordedSandboxFailure,
         uncertainOutcome,
         activityIdentity,
         durableAttempt,
@@ -1659,7 +1834,7 @@ export class ToolRuntime {
       });
       return sandboxError ? { error: msg, sandbox: sandboxError } : this.errorReturn(msg);
     } finally {
-      this.recordLoopGateOutcome(callSignature, attemptFailed);
+      this.recordLoopGateOutcome(callSignature, attemptFailed, attemptBoundaryFailure);
       if (reservedSubagentSlot) this.releaseSubagentSlot(tool);
     }
   }
@@ -2232,6 +2407,57 @@ export class ToolRuntime {
     queue: DurableSessionEventSink,
   ): Promise<SandboxBoundarySettlement> {
     throwIfAborted(abortSignal);
+    if (this.sandboxBoundaryFinalizationReason) {
+      throw new SandboxCommandError({
+        domain: 'command',
+        stage: 'validation',
+        reason: 'invalid_boundary_declaration',
+        recoverable: false,
+        message: 'Sandbox boundary negotiation is closed for this logical Turn.',
+      });
+    }
+    if (this.sandboxBoundaryDenied) {
+      this.forceSandboxBoundaryFinalization('post_denial_retry');
+      throw new SandboxCommandError({
+        domain: 'command',
+        stage: 'validation',
+        reason: 'invalid_boundary_declaration',
+        recoverable: false,
+        message: SANDBOX_BOUNDARY_DENIED_FOR_TURN,
+      });
+    }
+    if (this.sandboxBoundaryRequestInFlight) {
+      throw new SandboxCommandError({
+        domain: 'command',
+        stage: 'validation',
+        reason: 'invalid_boundary_declaration',
+        recoverable: true,
+        message: 'A sandbox boundary request is already pending for this logical Turn.',
+      });
+    }
+    this.sandboxBoundaryRequestInFlight = true;
+    try {
+      return await this.performSandboxBoundaryRequest(
+        turnId,
+        toolUseId,
+        expansion,
+        justification,
+        abortSignal,
+        queue,
+      );
+    } finally {
+      this.sandboxBoundaryRequestInFlight = false;
+    }
+  }
+
+  private async performSandboxBoundaryRequest(
+    turnId: string,
+    toolUseId: string,
+    expansion: SandboxBoundaryExpansion,
+    justification: string,
+    abortSignal: AbortSignal,
+    queue: DurableSessionEventSink,
+  ): Promise<SandboxBoundarySettlement> {
     const hostedRun = this.interactionRun();
     if (
       !hostedRun &&
@@ -2245,15 +2471,39 @@ export class ToolRuntime {
       // This remains part of the embedding API. Runtime Host supplies the
       // interaction capability for production clients, while an embedder can
       // still construct ToolRuntime without one.
-      throw new Error(SANDBOX_BOUNDARY_UNAVAILABLE);
+      throw new SandboxCommandError({
+        domain: 'command',
+        stage: 'validation',
+        reason: 'invalid_boundary_declaration',
+        recoverable: false,
+        message: SANDBOX_BOUNDARY_UNAVAILABLE,
+      });
     }
-    const normalized = await racePromiseWithAbort(
-      normalizeSandboxBoundaryExpansion(expansion, this.input.header.cwd),
-      abortSignal,
-    );
+    let normalized: SandboxBoundaryExpansion;
+    try {
+      normalized = await racePromiseWithAbort(
+        normalizeSandboxBoundaryExpansion(expansion, this.input.header.cwd),
+        abortSignal,
+      );
+    } catch (error) {
+      if (!(error instanceof SandboxBoundaryDeclarationError)) throw error;
+      throw new SandboxCommandError({
+        domain: 'command',
+        stage: 'validation',
+        reason: 'invalid_boundary_declaration',
+        recoverable: true,
+        message: error.message,
+      });
+    }
     const normalizedJustification = typeof justification === 'string' ? justification.trim() : '';
     if (typeof justification !== 'string' || normalizedJustification.length === 0) {
-      throw new Error('Sandbox boundary justification must not be empty');
+      throw new SandboxCommandError({
+        domain: 'command',
+        stage: 'validation',
+        reason: 'invalid_boundary_declaration',
+        recoverable: true,
+        message: 'Sandbox boundary justification must not be empty.',
+      });
     }
     const requestId = this.input.newId();
     const requestEvent: SandboxBoundaryRequestEvent = {
@@ -2379,6 +2629,23 @@ export class ToolRuntime {
       };
       if (hostedRun) await this.publishHostedSettlementAck(queue, decisionAck);
       else queue.push(decisionAck);
+      if (settlement.request.status === 'denied') {
+        this.sandboxBoundaryApprovalGeneration += 1;
+        this.sandboxBoundaryDenied = true;
+      } else if (settlement.request.status === 'approved') {
+        this.sandboxBoundaryApprovalGeneration += 1;
+        this.sandboxBoundaryDenied = false;
+        this.sandboxBoundaryInvalidAttempts = 0;
+        this.sandboxBoundaryUnresolvedRequirements = 0;
+        this.sandboxBoundaryInvalidCorrectionScopes.clear();
+        this.sandboxBoundaryRequirementCorrectionScopes.clear();
+        this.sandboxBoundaryFinalizationReason = undefined;
+      } else {
+        this.recordSandboxBoundaryNegotiationFailure(
+          { reason: 'requires_bypass' },
+          `tool-call:${toolUseId}`,
+        );
+      }
       return settlement;
     } finally {
       abortSignal.removeEventListener('abort', onAbort);
@@ -2828,7 +3095,11 @@ export function formatToolArgsViolationText(input: {
 function sandboxBoundaryFailureSignal(
   metadata: ReturnType<typeof serializeSandboxError>,
 ): Extract<ToolResultContent, { kind: 'text' }>['sandboxFailure'] {
-  if (metadata?.reason !== 'sandbox_boundary_required' && metadata?.reason !== 'requires_bypass') {
+  if (
+    metadata?.reason !== 'sandbox_boundary_required' &&
+    metadata?.reason !== 'requires_bypass' &&
+    metadata?.reason !== 'invalid_boundary_declaration'
+  ) {
     return undefined;
   }
   return {
@@ -2980,6 +3251,17 @@ function sandboxDenialKey(toolName: string, cwd: string, args: unknown): string 
       ? (args as { command: string }).command
       : '';
   return `${toolName}\u0000${cwd}\u0000${command}`;
+}
+
+function isBoundaryAuthorityAttempt(toolName: string, args: unknown): boolean {
+  if (toolName === REQUEST_SANDBOX_BOUNDARY_TOOL_NAME) return true;
+  if (toolName !== 'Bash' || !args || typeof args !== 'object') return false;
+  const record = args as Record<string, unknown>;
+  return (
+    Object.prototype.hasOwnProperty.call(record, 'boundary_intent') &&
+    record.boundary_intent !== undefined &&
+    record.boundary_intent !== 'current'
+  );
 }
 
 function deriveToolResultStatus(

@@ -28,7 +28,11 @@ import type { SessionSummary } from '@maka/core/session';
 import { normalizeUserSessionName } from '@maka/core/session-name';
 import type { CreateSessionRequest } from './session-driver.js';
 import { selectMakaRunSession } from './run-session-selection.js';
-import { sessionEventSandboxBoundaryFailureReason } from './sandbox-boundary-failure.js';
+import {
+  isGrantableSandboxBoundaryFailureReason,
+  sessionEventSandboxBoundaryFailureReason,
+  type SandboxBoundaryFailureReason,
+} from './sandbox-boundary-failure.js';
 import { resolveMakaWorkspaceRoot } from './workspace-root.js';
 
 export interface MakaRunOptions {
@@ -83,6 +87,7 @@ export interface MakaRunOutcome {
   finalOutput?: string;
   failure?: { class: string; message?: string };
   sandboxBoundary: 'none' | 'unresolved' | 'recovered';
+  sandboxBoundaryFailureReason?: SandboxBoundaryFailureReason;
 }
 
 export interface MakaRunContextInput {
@@ -418,7 +423,9 @@ export async function runMakaTextCliCore(
         deps.writeStderr(
           sandboxFailureReason === 'requires_bypass'
             ? 'maka run: sandbox bypass requires an explicit --yolo\n'
-            : 'maka run: sandbox boundary expansion is unavailable in non-interactive mode\n',
+            : isGrantableSandboxBoundaryFailureReason(sandboxFailureReason)
+              ? 'maka run: sandbox boundary expansion is unavailable in non-interactive mode\n'
+              : 'maka run: sandbox boundary negotiation did not converge; retry the turn\n',
         );
       }
     }

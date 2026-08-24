@@ -1849,7 +1849,7 @@ test('publishes only the minimal sandbox failure reason from a tool result', asy
     content: {
       kind: 'text',
       text: 'sensitive tool output',
-      sandboxFailure: { reason: 'sandbox_boundary_required' },
+      sandboxFailure: { reason: 'invalid_boundary_declaration' },
     },
   });
   await waitFor(() => sink.frames.length === 1);
@@ -1864,7 +1864,7 @@ test('publishes only the minimal sandbox failure reason from a tool result', asy
     ts: 2,
     toolUseId: 'tool-1',
     status: 'errored',
-    sandboxFailureReason: 'sandbox_boundary_required',
+    sandboxFailureReason: 'invalid_boundary_declaration',
   });
 
   connection.abort(opened.subscriptionId);

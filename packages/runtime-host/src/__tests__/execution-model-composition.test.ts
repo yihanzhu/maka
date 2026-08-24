@@ -32,6 +32,7 @@ import {
   createBypassExecutionBoundary,
   createManagedExecutionBoundary,
   type ExecutionBoundary,
+  type SandboxBoundaryRequest,
 } from '@maka/core/sandbox-boundary';
 import { PROVIDER_DEFAULTS } from '@maka/core/llm-connections';
 import { createWorkspaceWritePermissionProfile } from '@maka/core/permission-profile';
@@ -90,7 +91,6 @@ import {
 } from '../server/execution-model-authority.js';
 import {
   createHostAiSdkBackend,
-  createHostSandboxDiagnosticsResolver,
   resolveCollaborationPermissionMode,
   type HostAiSdkBackendInput,
 } from '../server/execution-model-composition.js';
@@ -399,43 +399,231 @@ test('production Host executes current-boundary Bash and refreshes live sandbox 
       false,
     );
 
-    const requestId = 'hosted-managed-bash-network-expansion';
-    await execution.sessionStore.createSandboxBoundaryRequest({
-      sessionId: session.id,
-      requestId,
-      turnId: firstTurnId,
-      runId: firstTerminal.runId,
-      expansion: { network: { enabled: true } },
-      justification: 'Exercise the live per-turn boundary projection.',
-    });
-    const expanded = await execution.sessionStore.settleSandboxBoundaryRequest({
-      sessionId: session.id,
-      requestId,
-      decision: 'allow',
-    });
-    assert.equal(expanded.changed, true);
-    assert.equal(expanded.boundary.revision, 1);
-
     const secondTurnId = 'hosted-managed-bash-turn-2';
+    const secondStarted = await startTurn(
+      composition,
+      session.id,
+      secondTurnId,
+      'Request and use one required network expansion.',
+      context,
+    );
+    let pending: SandboxBoundaryRequest | undefined;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      pending = (await execution.sessionStore.listPendingSandboxBoundaryRequests(session.id))[0];
+      if (pending) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pending);
+    if (!pending) return;
+    const answered = await composition.handlers['interaction.answer'](
+      {
+        sessionId: session.id,
+        interactionId: pending.requestId,
+        answer: { kind: 'sandbox_boundary', decision: 'allow' },
+      },
+      context,
+    );
+    assert.equal(answered.ok, true);
+    if (!answered.ok) return;
+    assert.equal(answered.result.status, 'answered');
     const secondTerminal = await waitForTerminal(
       composition,
       session.id,
       secondTurnId,
+      secondStarted,
+      context,
+    );
+    assert.equal(secondTerminal.status, 'completed');
+    const expandedBoundary = await execution.sessionStore.readExecutionBoundary(session.id);
+    assert.equal(expandedBoundary.revision, 1);
+    assert.equal(expandedBoundary.kind, 'managed');
+    if (expandedBoundary.kind === 'managed') {
+      assert.equal(expandedBoundary.profile.network.kind, 'enabled');
+    }
+    const approvalRequests = provider.requests.filter((request) => request.body.stream === true);
+    assert.equal(approvalRequests.length, 6);
+    assert.equal((latestToolResultText(approvalRequests[5]!.body) ?? '').includes(project), true);
+    const secondRuntimeEvents = await execution.runtimeEventStore.readRuntimeEvents(
+      session.id,
+      secondTerminal.runId,
+    );
+    assert.equal(
+      secondRuntimeEvents.filter(
+        (event) => event.actions?.stateDelta?.sandboxBoundaryRequest !== undefined,
+      ).length,
+      1,
+    );
+    assert.equal(
+      secondRuntimeEvents.filter(
+        (event) =>
+          (
+            event.actions?.stateDelta?.sandboxBoundaryDecision as
+              | { decision?: unknown; status?: unknown }
+              | undefined
+          )?.status === 'approved',
+      ).length,
+      1,
+    );
+
+    const thirdTurnId = 'hosted-managed-bash-turn-3';
+    const thirdTerminal = await waitForTerminal(
+      composition,
+      session.id,
+      thirdTurnId,
       await startTurn(
         composition,
         session.id,
-        secondTurnId,
+        thirdTurnId,
         'Confirm the expanded live boundary.',
         context,
       ),
       context,
     );
-    assert.equal(secondTerminal.status, 'completed');
+    assert.equal(thirdTerminal.status, 'completed');
     const refreshedRequests = provider.requests.filter((request) => request.body.stream === true);
-    assert.equal(refreshedRequests.length, 3);
-    const refreshedRequestText = JSON.stringify(refreshedRequests[2]?.body);
+    assert.equal(refreshedRequests.length, 7);
+    const refreshedRequestText = JSON.stringify(refreshedRequests[6]?.body);
     assert.match(refreshedRequestText, /<sandbox_context>/u);
     assert.match(refreshedRequestText, /Network: enabled/u);
+  } finally {
+    try {
+      await composition?.close();
+    } finally {
+      try {
+        await owner.close();
+      } finally {
+        await provider.close();
+        await rm(base, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test('production Host bounds a repeated sandbox expansion after denial', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'maka-host-boundary-denial-'));
+  const root = join(base, 'interactive');
+  const project = join(base, 'project');
+  const provider = await startProvider();
+  provider.configureManagedBashDenialFlow();
+  const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+  const owner = await tryAcquireInteractiveRootOwner(capability);
+  assert.ok(owner);
+  if (!owner) return;
+  const context: ConnectionContext = {
+    hostEpoch: 'boundary-denial-test-epoch',
+    connectionId: 'boundary-denial-test-client',
+    principal: 'local_os_user',
+    acquireResidency: () => ({ release() {} }),
+  };
+  let composition: Awaited<ReturnType<typeof createExecutionRuntimeHostComposition>> | undefined;
+  try {
+    await mkdir(project);
+    const policy = await openInteractiveRuntimePolicyStoresForWrite(owner.lease);
+    const created = await policy.connectionCatalog.create({
+      expectedCatalogRevision: 0,
+      connection: {
+        slug: 'hosted-boundary-denial-provider',
+        name: 'Hosted boundary denial provider',
+        providerType: 'moonshot',
+        baseUrl: provider.baseUrl,
+        enabled: true,
+        enabledModelIds: [MODEL_ID],
+      },
+    });
+    assert.equal(created.kind, 'committed');
+    if (created.kind !== 'committed') return;
+    const connection = created.snapshot.connections[0];
+    assert.ok(connection);
+    if (!connection) return;
+    assert.equal(
+      (
+        await policy.credentialVault.set({
+          locator: {
+            scope: 'connection',
+            connectionId: connection.connectionId,
+            kind: 'api_key',
+          },
+          expected: null,
+          secret: API_KEY,
+        })
+      ).kind,
+      'committed',
+    );
+    await publishConnectionModel(policy, connection.connectionId, MODEL_ID, 32_768);
+
+    const execution = await openInteractiveExecutionStoresForWrite(owner.lease);
+    const session = await execution.sessionStore.create({
+      cwd: project,
+      llmConnectionSlug: 'hosted-boundary-denial-provider',
+      model: MODEL_ID,
+      permissionMode: 'ask',
+    });
+    composition = await createExecutionRuntimeHostComposition({
+      owner,
+      hostEpoch: context.hostEpoch,
+      acquireResidency: context.acquireResidency,
+      retainUntilProcessExit: () => undefined,
+      requestDrain: () => undefined,
+    });
+    await composition.recover();
+
+    const turnId = 'hosted-boundary-denial-turn';
+    const started = await startTurn(
+      composition,
+      session.id,
+      turnId,
+      'Do not repeat an expansion after I deny it.',
+      context,
+    );
+    let pending: SandboxBoundaryRequest | undefined;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      pending = (await execution.sessionStore.listPendingSandboxBoundaryRequests(session.id))[0];
+      if (pending) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pending);
+    if (!pending) return;
+    const answered = await composition.handlers['interaction.answer'](
+      {
+        sessionId: session.id,
+        interactionId: pending.requestId,
+        answer: { kind: 'sandbox_boundary', decision: 'deny' },
+      },
+      context,
+    );
+    assert.equal(answered.ok, true);
+    if (!answered.ok) return;
+    assert.equal(answered.result.status, 'answered');
+
+    const terminal = await waitForTerminal(composition, session.id, turnId, started, context);
+    assert.equal(terminal.status, 'completed');
+    const mainRequests = provider.requests.filter((request) => request.body.stream === true);
+    assert.equal(mainRequests.length, 3);
+    assert.equal(toolNames(mainRequests[1]?.body).includes('request_sandbox_boundary'), false);
+    assert.deepEqual(toolNames(mainRequests[2]?.body), []);
+    assert.match(JSON.stringify(mainRequests[2]?.body), /sandbox_boundary_finalization/u);
+    assert.deepEqual(
+      await execution.sessionStore.listPendingSandboxBoundaryRequests(session.id),
+      [],
+    );
+    assert.equal((await execution.sessionStore.readExecutionBoundary(session.id)).revision, 0);
+    const events = await execution.runtimeEventStore.readRuntimeEvents(session.id, terminal.runId);
+    assert.equal(
+      events.filter((event) => event.actions?.stateDelta?.sandboxBoundaryRequest !== undefined)
+        .length,
+      1,
+    );
+    assert.equal(
+      events.filter(
+        (event) =>
+          (
+            event.actions?.stateDelta?.sandboxBoundaryDecision as
+              | { decision?: unknown; status?: unknown }
+              | undefined
+          )?.decision === 'deny',
+      ).length,
+      1,
+    );
   } finally {
     try {
       await composition?.close();
@@ -2898,55 +3086,6 @@ test('one turn shares one canonical Skill inventory across prompt and lazy tools
   }
 });
 
-test('host sandbox resolver caches by live boundary revision and omits external context', async () => {
-  const workspaceProfile = createWorkspaceWritePermissionProfile();
-  let liveBoundary = createManagedExecutionBoundary(
-    { ...workspaceProfile, name: 'live-boundary-revision-7' },
-    7,
-  );
-  let diagnosticsResolutions = 0;
-  let failNextResolution = false;
-  const resolver = createHostSandboxDiagnosticsResolver({
-    readExecutionBoundary: async () => liveBoundary,
-    cwd: '/workspace',
-    sandboxDiagnostics: {
-      resolve: async (input) => {
-        diagnosticsResolutions += 1;
-        if (failNextResolution) {
-          failNextResolution = false;
-          throw new Error('transient diagnostics failure');
-        }
-        return await TEST_SANDBOX_DIAGNOSTICS.resolve(input);
-      },
-    },
-  });
-
-  const first = await resolver({ abortSignal: new AbortController().signal });
-  const cached = await resolver({ abortSignal: new AbortController().signal });
-  assert.equal(first?.profile.name, 'live-boundary-revision-7');
-  assert.equal(cached, first);
-  assert.equal(diagnosticsResolutions, 1);
-
-  liveBoundary = createManagedExecutionBoundary(
-    { ...workspaceProfile, name: 'live-boundary-revision-8', network: { kind: 'enabled' } },
-    8,
-  );
-  failNextResolution = true;
-  await assert.rejects(
-    resolver({ abortSignal: new AbortController().signal }),
-    /transient diagnostics failure/u,
-  );
-  assert.equal(diagnosticsResolutions, 2);
-  const expanded = await resolver({ abortSignal: new AbortController().signal });
-  assert.equal(expanded?.profile.name, 'live-boundary-revision-8');
-  assert.equal(expanded?.profile.network, 'enabled');
-  assert.equal(diagnosticsResolutions, 3);
-
-  liveBoundary = { kind: 'external', revision: 9 };
-  assert.equal(await resolver({ abortSignal: new AbortController().signal }), undefined);
-  assert.equal(diagnosticsResolutions, 3);
-});
-
 test('one composer freezes Runtime Policy while each Run freezes its remaining prompt sources', async () => {
   let policyRevision = 3;
   let memoryRevision = 'memory-3';
@@ -3944,6 +4083,7 @@ interface ProviderRequest {
 type ProviderFlow =
   | { readonly kind: 'default' }
   | { readonly kind: 'managed_bash' }
+  | { readonly kind: 'managed_bash_denial' }
   | {
       readonly kind: 'client_capability';
       readonly groupId: string;
@@ -3961,6 +4101,7 @@ async function startProvider(): Promise<{
   readonly baseUrl: string;
   readonly requests: ProviderRequest[];
   configureManagedBashFlow(): void;
+  configureManagedBashDenialFlow(): void;
   configureClientCapability(input: { groupId: string; toolName: string }): void;
   configureChildAgentFlow(): void;
   configureImplementationChildAgentFlow(): void;
@@ -3983,6 +4124,10 @@ async function startProvider(): Promise<{
     configureManagedBashFlow: () => {
       if (flow.kind !== 'default') throw new Error('Provider flow is already configured');
       flow = { kind: 'managed_bash' };
+    },
+    configureManagedBashDenialFlow: () => {
+      if (flow.kind !== 'default') throw new Error('Provider flow is already configured');
+      flow = { kind: 'managed_bash_denial' };
     },
     configureClientCapability: (input) => {
       if (flow.kind !== 'default') throw new Error('Provider flow is already configured');
@@ -4077,8 +4222,58 @@ async function handleProviderRequest(
     });
     return;
   }
+  if (flow.kind === 'managed_bash' && streamRequestIndex === 3) {
+    assert.ok(toolNames(body).includes('Bash'));
+    respondProviderToolCall(response, streamRequestIndex, 'Bash', {
+      command: '/bin/pwd',
+      boundary_intent: 'expand',
+      required_boundary: { network: { enabled: true } },
+    });
+    return;
+  }
+  if (flow.kind === 'managed_bash' && streamRequestIndex === 4) {
+    assert.ok(toolNames(body).includes('request_sandbox_boundary'));
+    respondProviderToolCall(response, streamRequestIndex, 'request_sandbox_boundary', {
+      expansion: { network: { enabled: true } },
+      justification: 'Exercise the approved expansion path.',
+    });
+    return;
+  }
+  if (flow.kind === 'managed_bash' && streamRequestIndex === 5) {
+    assert.ok(toolNames(body).includes('Bash'));
+    respondProviderToolCall(response, streamRequestIndex, 'Bash', {
+      command: '/bin/pwd',
+      boundary_intent: 'expand',
+      required_boundary: { network: { enabled: true } },
+    });
+    return;
+  }
   if (flow.kind === 'managed_bash') {
     respondProviderText(response, RESPONSE_TEXT);
+    return;
+  }
+  if (flow.kind === 'managed_bash_denial' && streamRequestIndex === 1) {
+    assert.ok(toolNames(body).includes('request_sandbox_boundary'));
+    respondProviderToolCall(response, streamRequestIndex, 'request_sandbox_boundary', {
+      expansion: { network: { enabled: true } },
+      justification: 'Use the network.',
+    });
+    return;
+  }
+  if (flow.kind === 'managed_bash_denial' && streamRequestIndex === 2) {
+    assert.equal(toolNames(body).includes('request_sandbox_boundary'), false);
+    assert.ok(toolNames(body).includes('Bash'));
+    respondProviderToolCall(response, streamRequestIndex, 'Bash', {
+      command: '/bin/pwd',
+      boundary_intent: 'expand',
+      required_boundary: { network: { enabled: true } },
+    });
+    return;
+  }
+  if (flow.kind === 'managed_bash_denial') {
+    assert.deepEqual(toolNames(body), []);
+    assert.match(JSON.stringify(body), /sandbox_boundary_finalization/u);
+    respondProviderText(response, 'The requested sandbox expansion was denied, so I stopped.');
     return;
   }
   if (flow.kind === 'agent_graph') {

@@ -92,6 +92,15 @@ describe('sandbox boundary failure tool result metadata', () => {
     assert.deepEqual(toolResultContent(decodePersistedMessage(storedToolResult(result))), result);
   });
 
+  test('preserves an invalid boundary declaration reason', () => {
+    const result = {
+      kind: 'text',
+      text: 'boundary declaration is invalid',
+      sandboxFailure: { reason: 'invalid_boundary_declaration' as const },
+    };
+    assert.deepEqual(decodeCanonicalToolResultContent(result), result);
+  });
+
   test('rejects malformed or widened boundary failure signals', () => {
     for (const sandboxFailure of [
       { reason: 'sandbox_denial' },

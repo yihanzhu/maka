@@ -6231,6 +6231,137 @@ describe('SessionManager permission mode updates', () => {
     expect(backendCalls).toBe(1);
   });
 
+  test('passes hidden full-lineage boundary negotiation state into a continuation backend', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    let observedState: BackendSendInput['sandboxBoundaryNegotiationState'];
+    backends.register(
+      'ai-sdk',
+      (ctx) =>
+        new CountingFinalTextBackend(ctx, (input) => {
+          observedState = input.sandboxBoundaryNegotiationState;
+        }),
+    );
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      inspectContinuationSafety: inspectStableContinuationSafety,
+      newId: nextId(),
+      now: nextNow(6_571),
+      runtimeSource: 'test',
+    });
+    const session = await manager.createSession(makeInput());
+    const header = await store.readHeader(session.id);
+    const sourceRunId = 'source-run-hidden-boundary-state';
+    const sourceTurnId = 'source-turn-hidden-boundary-state';
+    const sourceInvocationId = 'source-invocation-hidden-boundary-state';
+    const sourceEvents: RuntimeEvent[] = [
+      runtimeEvent({
+        id: 'source-user-hidden-boundary-state',
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        sessionId: session.id,
+        turnId: sourceTurnId,
+        ts: 1,
+        role: 'user',
+        author: 'user',
+        content: { kind: 'text', text: 'inspect protected paths' },
+      }),
+    ];
+    for (let index = 1; index <= 3; index += 1) {
+      sourceEvents.push(
+        runtimeEvent({
+          id: `hidden-boundary-call-${index}`,
+          invocationId: sourceInvocationId,
+          runId: sourceRunId,
+          sessionId: session.id,
+          turnId: sourceTurnId,
+          ts: index * 2,
+          role: 'model',
+          author: 'agent',
+          modelVisibility: 'hidden',
+          content: {
+            kind: 'function_call',
+            id: `hidden-read-${index}`,
+            name: 'Read',
+            args: { path: `/outside/${index}` },
+          },
+          refs: { stepId: `hidden-step-${index}` },
+        }),
+        runtimeEvent({
+          id: `hidden-boundary-result-${index}`,
+          invocationId: sourceInvocationId,
+          runId: sourceRunId,
+          sessionId: session.id,
+          turnId: sourceTurnId,
+          ts: index * 2 + 1,
+          role: 'tool',
+          author: 'tool',
+          modelVisibility: 'hidden',
+          content: {
+            kind: 'function_response',
+            id: `hidden-read-${index}`,
+            name: 'Read',
+            isError: true,
+            result: {
+              kind: 'text',
+              text: 'boundary required',
+              sandboxFailure: { reason: 'sandbox_boundary_required' },
+            },
+          },
+        }),
+      );
+    }
+    sourceEvents.push(
+      runtimeEvent({
+        id: 'source-terminal-hidden-boundary-state',
+        invocationId: sourceInvocationId,
+        runId: sourceRunId,
+        sessionId: session.id,
+        turnId: sourceTurnId,
+        ts: 8,
+        status: 'failed',
+        actions: { endInvocation: true, stateDelta: { failureClass: 'app_restarted' } },
+      }),
+    );
+    await seedRuntimeRun(
+      runStore,
+      makeRunHeader({
+        runId: sourceRunId,
+        sessionId: session.id,
+        turnId: sourceTurnId,
+        status: 'failed',
+        cwd: header.cwd,
+        createdAt: 1,
+        updatedAt: 8,
+        completedAt: 8,
+        failureClass: 'app_restarted',
+      }),
+      sourceEvents,
+    );
+    const plan = await manager.planSafeBoundaryContinuation(session.id, {
+      sourceRunId,
+      currentCwd: header.cwd,
+      sourceWorkspaceIdentity: 'workspace-1',
+      currentWorkspaceIdentity: 'workspace-1',
+      backgroundOperationsSettled: true,
+      availableToolNames: [],
+    });
+    if (!plan.continuation) throw new Error('expected hidden-boundary continuation');
+
+    await collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation));
+
+    expect(observedState).toEqual({
+      denied: false,
+      invalidAttempts: 0,
+      unresolvedRequirements: 3,
+      finalizationReason: 'unresolved_requirement_limit',
+    });
+  });
+
   test('serializes concurrent continuation claims for the same source boundary', async () => {
     const store = new MemorySessionStore();
     const runStore = new ContinuationClaimBarrierRunStore();
@@ -16138,13 +16269,13 @@ class FinalTextTestBackend extends TestBackend {
 class CountingFinalTextBackend extends FinalTextTestBackend {
   constructor(
     ctx: BackendFactoryContext,
-    private readonly onSend: () => void,
+    private readonly onSend: (input: BackendSendInput) => void,
   ) {
     super(ctx);
   }
 
   override async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
-    this.onSend();
+    this.onSend(input);
     yield* super.send(input);
   }
 }

@@ -780,6 +780,9 @@ export class AiSdkFlow implements AgentFlow, AgentFlowControl {
         ...(input.quotes !== undefined ? { quotes: input.quotes } : {}),
         context: input.context,
         ...(input.runtimeContext !== undefined ? { runtimeContext: input.runtimeContext } : {}),
+        ...(input.sandboxBoundaryNegotiationState !== undefined
+          ? { sandboxBoundaryNegotiationState: input.sandboxBoundaryNegotiationState }
+          : {}),
         ...(input.continuation !== undefined ? { continuation: input.continuation } : {}),
         ...(input.pullSteering !== undefined ? { pullSteering: input.pullSteering } : {}),
         ...(input.ackSteering !== undefined ? { ackSteering: input.ackSteering } : {}),
