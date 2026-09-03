@@ -30,6 +30,7 @@ export const links = {
   docs: `${main}/docs/README.md`,
   eval: `${repo}/tree/main/docs/eval`,
   nineArm: `${main}/docs/eval/terminal-bench-2.1-deepseek-v4-flash-nine-arm.md`,
+  nineArmCsv: `${main}/docs/eval/terminal-bench-2.1-deepseek-v4-flash-nine-arm.csv`,
   paired: `${main}/docs/eval/terminal-bench-2.1-deepseek-v4-flash-maka-vs-opencode.md`,
   security: `${main}/SECURITY.md`,
   windows: `${main}/docs/windows-support.md`,

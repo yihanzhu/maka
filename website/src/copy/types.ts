@@ -19,6 +19,13 @@
 
 export type Locale = 'en' | 'zh-CN';
 
+// One difficulty band on the nine-harness run: how many of the nine solved a
+// task decides its band; the numbers come from the per-task CSV.
+export interface DifficultyRow {
+  label: string;
+  sub: string;
+}
+
 // One shape for both languages, so a section, claim or link added to one
 // page cannot be forgotten on the other: the type checker refuses it.
 export interface Copy {
@@ -45,6 +52,8 @@ export interface Copy {
     architecture: string;
   };
   scene: {
+    // Seven steps of one turn, each a RuntimeEvent, named the way a reader
+    // would describe them rather than by the event type.
     events: Array<{
       tone: '' | 'mut' | 'warn' | 'ok' | 'dim' | 'dim ok';
       name: string;
@@ -54,25 +63,38 @@ export interface Copy {
     caption: string;
     formula: string;
   };
-  measured: { h2: string; p: string };
-  leaderboard: { h3: string; p: string; more: string; caption: string };
-  paired: { h3: string; p: string; more: string; stat: string; statSmall: string };
-  host: { h3: string; p: string; more: string; clients: string[]; core: string; coreSmall: string };
-  log: { h3: string; p: string; more: string };
+  measured: { h2: string };
+  // meta is the one line of context a figure cannot carry itself: which benchmark, which model.
+  leaderboard: { h3: string; meta: string; more: string; caption: string };
+  scatter: { h3: string; more: string; x: string; y: string; caption: string };
+  paired: {
+    h3: string;
+    more: string;
+    maka: string;
+    other: string;
+    of: string;
+    gap: string;
+    note: string;
+  };
+  difficulty: {
+    h3: string;
+    more: string;
+    rows: [DifficultyRow, DifficultyRow, DifficultyRow];
+    caption: string;
+  };
   get: {
     h3: string;
-    p: string;
     nightly: { title: string; body: string; note: string };
     source: { title: string; body: string; note: string };
     releases: { title: string; body: string; note: string };
   };
   reads: {
     h2: string;
-    p: string;
-    blogLog: { cover: string; small: string; h3: string; meta: string };
-    blogTools: { cover: string; small: string; h3: string; meta: string };
-    nineArm: { cover: string; small: string; h3: string; meta: string };
-    paired: { cover: string; small: string; h3: string; meta: string };
+    // cover is the one-sentence takeaway a visitor reads before the title; kind says Blog or Report.
+    blogLog: { cover: string; kind: string; h3: string; meta: string };
+    blogTools: { cover: string; kind: string; h3: string; meta: string };
+    nineArm: { cover: string; kind: string; h3: string; meta: string };
+    paired: { cover: string; kind: string; h3: string; meta: string };
   };
   footer: {
     foundation: string;

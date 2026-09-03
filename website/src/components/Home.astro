@@ -29,19 +29,47 @@ const { copy } = Astro.props;
 const l = copy.locale;
 const downloads = `/${l}/downloads/`;
 
-// Pass@1 from docs/eval/terminal-bench-2.1-deepseek-v4-flash-nine-arm.md.
-// The report owns these numbers; this figure only draws them.
-const leaderboard = [
-  ['Codex', 82.0],
-  ['Maka', 77.5],
-  ['Pi', 74.2],
-  ['DSH', 73.0],
-  ['ZCode', 70.8],
-  ['Reasonix', 67.4],
-  ['OpenCode', 65.2],
-  ['Kimi Code', 59.6],
-  ['Claude Code', 55.1],
+// Every number below is drawn from docs/eval/terminal-bench-2.1-deepseek-v4-flash-nine-arm.md
+// and docs/eval/terminal-bench-2.1-deepseek-v4-flash-maka-vs-opencode.md. The reports own the
+// numbers; these figures only draw them.
+
+// Leaderboard and cost per pass, nine harnesses on DeepSeek V4 Flash.
+const harnesses = [
+  { name: 'Codex', pct: 82.0, cost: 0.028832 },
+  { name: 'Maka', pct: 77.5, cost: 0.026307 },
+  { name: 'Pi', pct: 74.2, cost: 0.019739 },
+  { name: 'DSH', pct: 73.0, cost: 0.02623 },
+  { name: 'ZCode', pct: 70.8, cost: 0.036303 },
+  { name: 'Reasonix', pct: 67.4, cost: 0.032252 },
+  { name: 'OpenCode', pct: 65.2, cost: 0.030084 },
+  { name: 'Kimi Code', pct: 59.6, cost: 0.040798 },
+  { name: 'Claude Code', pct: 55.1, cost: 0.053741 },
 ] as const;
+
+// Scatter geometry: cost on x, pass@1 on y. Labels sit to the right of their dot
+// unless two dots are close enough for the labels to collide.
+const sc = { w: 560, h: 300, left: 44, right: 548, top: 16, bottom: 258 };
+const scX = (cost: number) => sc.left + ((cost - 0.015) / (0.058 - 0.015)) * (sc.right - sc.left);
+const scY = (pct: number) => sc.bottom - ((pct - 50) / (86 - 50)) * (sc.bottom - sc.top);
+const scLabel: Record<string, { dx: number; dy: number; anchor: 'start' | 'end' }> = {
+  OpenCode: { dx: -10, dy: 4, anchor: 'end' },
+  Pi: { dx: -10, dy: 4, anchor: 'end' },
+  'Claude Code': { dx: -10, dy: 4, anchor: 'end' },
+};
+const scXTicks = [0.02, 0.03, 0.04, 0.05];
+const scYTicks = [50, 60, 70, 80];
+
+// Paired run against OpenCode: 61/89 to 49/89, drawn as two bars on one 89-task scale.
+const paired = { total: 89, maka: 61, other: 49 };
+const pct = (n: number) => `${((n / paired.total) * 100).toFixed(2)}%`;
+
+// The 89 tasks in three bands by how many of the nine harnesses solved each, from the
+// per-task CSV: 7-9 solvers, 4-6, and 3 or fewer, with Maka's passes in each band.
+const bands = [
+  { tasks: 48, passed: 48 },
+  { tasks: 25, passed: 19 },
+  { tasks: 16, passed: 2 },
+];
 
 const reads = [
   { ...copy.reads.blogLog, href: localized.blogLog[l] },
@@ -74,18 +102,15 @@ const reads = [
   </header>
 
   <section class="sec">
-    <div class="sec-h">
-      <h2>{copy.measured.h2}</h2>
-      <p>{copy.measured.p}</p>
-    </div>
+    <div class="sec-h"><h2>{copy.measured.h2}</h2></div>
     <div class="bento">
       <div class="tile c5 r2">
         <h3>{copy.leaderboard.h3}</h3>
-        <p>{copy.leaderboard.p}</p>
+        <p class="meta">{copy.leaderboard.meta}</p>
         <a class="more" href={links.nineArm}>{copy.leaderboard.more}</a>
         <div class="fig">
           <div class="lb">
-            {leaderboard.map(([name, pct], index) => (
+            {harnesses.map(({ name, pct }, index) => (
               <div class:list={['row', { me: name === 'Maka' }]}>
                 <span class="rk">{index + 1}</span>
                 <span class="nm">{name}</span>
@@ -97,35 +122,79 @@ const reads = [
           </div>
         </div>
       </div>
-      <div class="tile c4">
+
+      <div class="tile c7 r2 plain">
+        <h3>{copy.scatter.h3}</h3>
+        <a class="more" href={`${links.nineArm}#outcome-normalized-economics`}>{copy.scatter.more}</a>
+        <figure class="fig chart">
+          <svg viewBox={`0 0 ${sc.w} ${sc.h}`} role="img" aria-label={`${copy.scatter.y} / ${copy.scatter.x}`}>
+            {scYTicks.map((t) => (
+              <>
+                <line class="grid" x1={sc.left} x2={sc.right} y1={scY(t)} y2={scY(t)} />
+                <text class="tick" x={sc.left - 8} y={scY(t) + 4} text-anchor="end">{t}%</text>
+              </>
+            ))}
+            {scXTicks.map((t) => (
+              <text class="tick" x={scX(t)} y={sc.bottom + 18} text-anchor="middle">${t.toFixed(2)}</text>
+            ))}
+            <line class="axis" x1={sc.left} x2={sc.right} y1={sc.bottom} y2={sc.bottom} />
+            <text class="axis-title" x={sc.right} y={sc.bottom + 36} text-anchor="end">{copy.scatter.x} →</text>
+            <text class="axis-title" x={sc.left} y={sc.top - 4} text-anchor="start">↑ {copy.scatter.y}</text>
+            {harnesses.map(({ name, pct, cost }) => {
+              const me = name === 'Maka';
+              const lab = scLabel[name] ?? { dx: 10, dy: 4, anchor: 'start' };
+              return (
+                <g class:list={['pt', { me }]}>
+                  <title>{`${name} · ${pct.toFixed(1)}% · $${cost.toFixed(4)}`}</title>
+                  <circle cx={scX(cost)} cy={scY(pct)} r={me ? 7 : 5} />
+                  <text class="lbl" x={scX(cost) + lab.dx} y={scY(pct) + lab.dy} text-anchor={lab.anchor}>{name}</text>
+                </g>
+              );
+            })}
+          </svg>
+          <figcaption class="cap">{copy.scatter.caption}</figcaption>
+        </figure>
+      </div>
+
+      <div class="tile c6">
         <h3>{copy.paired.h3}</h3>
-        <p>{copy.paired.p}</p>
         <a class="more" href={links.paired}>{copy.paired.more}</a>
-        <div class="fig"><div class="stat">{copy.paired.stat}<small>{copy.paired.statSmall}</small></div></div>
+        <figure class="fig chart bars">
+          <div class="bar me">
+            <span class="nm">{copy.paired.maka}</span>
+            <div class="tr">
+              <div class="fi" style={`width:${pct(paired.maka)}`}></div>
+              <div class="gap" style={`left:${pct(paired.other)};width:${pct(paired.maka - paired.other)}`}></div>
+              <span class="gl" style={`left:${pct(paired.maka)}`}>{copy.paired.gap}</span>
+            </div>
+            <span class="pc"><b>{paired.maka}</b> {copy.paired.of}</span>
+          </div>
+          <div class="bar">
+            <span class="nm">{copy.paired.other}</span>
+            <div class="tr"><div class="fi" style={`width:${pct(paired.other)}`}></div></div>
+            <span class="pc"><b>{paired.other}</b> {copy.paired.of}</span>
+          </div>
+          <figcaption class="cap">{copy.paired.note}</figcaption>
+        </figure>
       </div>
-      <div class="tile c3 plain">
-        <h3>{copy.host.h3}</h3>
-        <p>{copy.host.p}</p>
-        <a class="more" href={localized.runtimeHost[l]}>{copy.host.more}</a>
-        <div class="fig host">
-          <div class="col">{copy.host.clients.map((client) => <span class="chip">{client}</span>)}</div>
-          <div class="lines">→</div>
-          <div class="core">{copy.host.core}<small>{copy.host.coreSmall}</small></div>
-        </div>
-      </div>
-      <div class="tile c7">
-        <h3>{copy.log.h3}</h3>
-        <p>{copy.log.p}</p>
-        <a class="more" href={localized.blogLog[l]}>{copy.log.more}</a>
-        <div class="fig evs">
-          {copy.scene.events.map((event, index) => (
-            <span class:list={['e', event.tone.replace('dim', '').trim()]} style={`--i: ${index}`}>{event.name}</span>
+
+      <div class="tile c6 plain">
+        <h3>{copy.difficulty.h3}</h3>
+        <a class="more" href={links.nineArmCsv}>{copy.difficulty.more}</a>
+        <figure class="fig chart bands">
+          {bands.map(({ tasks, passed }, i) => (
+            <div class="band">
+              <div class="lab"><b>{copy.difficulty.rows[i].label}</b><small>{copy.difficulty.rows[i].sub}</small></div>
+              <div class="tr"><div class="fi" style={`width:${((passed / tasks) * 100).toFixed(1)}%`}></div></div>
+              <div class="val"><b>{((passed / tasks) * 100).toFixed(passed === tasks ? 0 : 1)}%</b><small>{passed}/{tasks}</small></div>
+            </div>
           ))}
-          <span class="cur" style={`--i: ${copy.scene.events.length}`}></span>
-        </div>
+          <figcaption class="cap">{copy.difficulty.caption}</figcaption>
+        </figure>
       </div>
+
       <div class="tile c12 plain get">
-        <div class="get-h"><h3>{copy.get.h3}</h3><p>{copy.get.p}</p></div>
+        <div class="get-h"><h3>{copy.get.h3}</h3></div>
         <div class="paths3">
           <a class="path" href={links.releases}>
             <div><b>{copy.get.nightly.title}</b><span>{copy.get.nightly.body}</span></div>
@@ -145,33 +214,15 @@ const reads = [
   </section>
 
   <section class="sec">
-    <div class="sec-h">
-      <h2>{copy.reads.h2}</h2>
-      <p>{copy.reads.p}</p>
-    </div>
+    <div class="sec-h"><h2>{copy.reads.h2}</h2></div>
     <div class="reads">
       {reads.map((read) => (
         <a class="rc" href={read.href}>
-          <div class="cover">
-            {read.cover.split('\n').map((line, index) => (index === 0 ? line : <><br />{line}</>))}
-            <small>{read.small}</small>
-          </div>
+          <div class="cover"><small>{read.kind}</small>{read.cover}</div>
           <div class="body"><h3>{read.h3}</h3><div class="meta">{read.meta}</div></div>
         </a>
       ))}
     </div>
   </section>
 
-  <script is:inline>
-    // The log tile appends its events one by one the first time it scrolls into view.
-    (() => {
-      const log = document.querySelector('.evs');
-      log.classList.add('armed');
-      new IntersectionObserver((entries, observer) => {
-        if (!entries.some((entry) => entry.isIntersecting)) return;
-        log.classList.add('play');
-        observer.disconnect();
-      }, { threshold: 0.6 }).observe(log);
-    })();
-  </script>
 </Site>
